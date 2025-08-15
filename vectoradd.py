@@ -5,48 +5,34 @@ import triton.language as tl
 
 import tinygrad
 
-# - {"size": 127, "seed": 4242}
-# - {"size": 128, "seed": 5236}
-# - {"size": 129, "seed": 1001}
-# - {"size": 256, "seed": 5531}
-# - {"size": 512, "seed": 9173}
-
-generator = torch.Generator(device="cuda")
-
-size = 127
-generator.manual_seed(4242)
-
-A = torch.randn(size, size, device="cuda", dtype=torch.float16, generator=generator).contiguous()
-B = torch.randn(size, size, device="cuda", dtype=torch.float16, generator=generator).contiguous()
-
-# A = torch.ones(size, size, device="cuda", dtype=torch.float16).contiguous()
-# B = torch.ones(size, size, device="cuda", dtype=torch.float16).contiguous()
-
 def reference_vectoradd(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     result = A + B
     return result
 
 @triton.jit
-def triton_vectoradd_kernel(a_ptr: tl.tensor, b_ptr: tl.tensor, c_ptr: tl.tensor, element_count: int, BLOCK_DIM: tl.constexpr):
-    # Load
-    offsets = tl.arange(0, BLOCK_DIM)[:, None]*BLOCK_DIM + tl.arange(0, BLOCK_DIM)
-    mask = offsets < element_count
-    a = tl.load(a_ptr + offsets, mask)
-    b = tl.load(b_ptr + offsets, mask)
-
-    # Process
-    c: tl.tensor = a + b
-
-    # Store
-    tl.store(c_ptr + offsets, c, mask)
+def triton_vectoradd_kernel(a_ptr: tl.tensor, b_ptr: tl.tensor, c_ptr: tl.tensor, N: int, BLOCK_DIM: tl.constexpr):
+    """
+    We launch one block/program for each row of N elements.
+    Each block, then, processes BLOCK_DIM elements of the row at a time.
+    """
+    row = tl.program_id(0)
+    base_offset = row*N
+    for i in range((N + BLOCK_DIM - 1)//BLOCK_DIM):
+        # Load
+        offsets = base_offset + i*BLOCK_DIM + tl.arange(0, BLOCK_DIM)
+        mask = offsets < base_offset + N
+        a = tl.load(a_ptr + offsets, mask)
+        b = tl.load(b_ptr + offsets, mask)
+        # Process
+        c: tl.tensor = a + b
+        # Sore
+        tl.store(c_ptr + offsets, c, mask)
 
 def triton_vectoradd(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     c = torch.empty_like(a, device="cuda").contiguous()
-
-    grid = lambda metaparams: (1, 1, 1)
-    # TODO(achal): Can I decide the BLOCK_DIM based on input element count?
-    triton_vectoradd_kernel[grid](a, b, c, c.numel(), BLOCK_DIM=128)
-
+    N = c.shape[0]
+    grid = lambda metaparams: (N, 1, 1)
+    triton_vectoradd_kernel[grid](a, b, c, N, BLOCK_DIM=128)
     return c
 
 # TODO(achal)
@@ -66,37 +52,40 @@ def tinygrad_vectoradd(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
     # return torch.from_numpy(c_tiny.numpy()).to("cuda").to(torch.float16)
 
-# C = tinygrad_vectoradd(A, B)
-
 def cuda_vectoradd(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     cuda_source = """
     template <typename scalar_t>
     __global__ void cuda_vectoradd_kernel(const scalar_t *__restrict__ a, const scalar_t *__restrict__ b, scalar_t *__restrict__ c, int N)
     {
-        int row = threadIdx.x;
-        if (row < N)
+        int block_dim = blockDim.x;
+
+        int row = blockIdx.x;
+        int base_offset = row*N;
+        for (int col_start = 0; col_start < (N + block_dim - 1)/block_dim; ++col_start)
         {
-            for (int col = 0; col < N; ++col)
+            int col = base_offset + col_start*block_dim + threadIdx.x;
+            if (col < base_offset + N)
             {
-                if (col < N)
-                {
-                    int index = threadIdx.x*blockDim.x + col;
-                    c[index] = a[index] + b[index];
-                }
+                c[col] = a[col] + b[col];
             }
         }
     }
 
     void cuda_vectoradd(torch::Tensor a, torch::Tensor b, torch::Tensor c)
     {
-        int BLOCK_DIM = 128;
-        int element_count = a.numel();
-        int block_count = (element_count + BLOCK_DIM - 1)/element_count;
+        int block_dim = 128;
+
+        int row_count = a.sizes()[0];
+        int col_count = a.sizes()[1];
+        assert(row_count == col_count);
+
+        int N = row_count;
+        int block_count = col_count;
         
         // NOTE(achal): This might be host code but it is still CUDA syntax;
         // you cannot put it in cpp_source!
         AT_DISPATCH_FLOATING_TYPES_AND_HALF(a.scalar_type(), "cuda_vectoradd_kernel", [&]{
-            cuda_vectoradd_kernel<<<block_count, BLOCK_DIM>>>(a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), c.data_ptr<scalar_t>(), element_count);
+            cuda_vectoradd_kernel<<<block_count, block_dim>>>(a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), c.data_ptr<scalar_t>(), N);
         });
 
         cudaError_t err = cudaGetLastError();
@@ -111,19 +100,53 @@ def cuda_vectoradd(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
     void cuda_vectoradd(torch::Tensor a, torch::Tensor b, torch::Tensor c);
     """
-    vectoradd_module = load_inline(name="cuda_vectoradd", cpp_sources=cpp_source, cuda_sources=cuda_source, functions=["cuda_vectoradd"], verbose=True)
+    vectoradd_module = load_inline(name="cuda_vectoradd", cpp_sources=cpp_source, cuda_sources=cuda_source, functions=["cuda_vectoradd"], verbose=False)
     c = torch.empty_like(a)
     vectoradd_module.cuda_vectoradd(a, b, c)
     return c
 
-# Match each of them to the reference output
-C_reference = reference_vectoradd(A, B)
-# C_triton = triton_vectoradd(A, B)
-# torch.testing.assert_close(C_triton, C_reference)
-# print("Triton: Passed")
+# https://github.com/gpu-mode/reference-kernels/blob/ee95b29fee216818ab497744265f2197a39b05f7/problems/pmpp_v2/vectoradd_py/task.yml#L25
+test_cases: list[tuple[int, int]] = [
+    # (size, seed)
+    (127, 4242),
+    (128, 5236),
+    (129, 1001),
+    (256, 5531),
+    (512, 9173),
+]
 
-C_cuda = cuda_vectoradd(A, B)
-if torch.allclose(C_cuda, C_reference):
-    print("CUDA: Passed")
-else:
-    print("CUDA: Failed")
+generator = torch.Generator(device="cuda")
+
+for test_case in test_cases:
+    size, seed = test_case
+    print(f"===Test [size: {size}, seed: {seed}]===")
+    generator.manual_seed(seed)
+
+    A = torch.randn(size, size, device="cuda", dtype=torch.float16, generator=generator).contiguous()
+    B = torch.randn(size, size, device="cuda", dtype=torch.float16, generator=generator).contiguous()
+
+    # A = torch.ones(size, size, device="cuda", dtype=torch.float16).contiguous()
+    # B = torch.ones(size, size, device="cuda", dtype=torch.float16).contiguous()
+
+    C_reference = reference_vectoradd(A, B)
+    C_triton = triton_vectoradd(A, B)
+    # C = tinygrad_vectoradd(A, B)
+    C_cuda = cuda_vectoradd(A, B)
+
+    # torch.testing.assert_close(C_triton, C_reference)
+    # print("Triton: Passed")
+
+    if torch.allclose(C_triton, C_reference):
+        print("Triton: Passed")
+    else:
+        print("Triton: Failed")
+
+    # if torch.allclose(C_tinygrad, C_reference):
+    #     print("tinygrad: Passed")
+    # else:
+    #     print("tinygrad: Failed")
+
+    if torch.allclose(C_cuda, C_reference):
+        print("CUDA: Passed")
+    else:
+        print("CUDA: Failed")

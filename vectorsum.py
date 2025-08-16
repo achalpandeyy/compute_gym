@@ -1,13 +1,28 @@
 import torch
 from torch.utils.cpp_extension import load_inline
+import triton
+import triton.language as tl
 
 def reference_vectorsum(a: torch.Tensor) -> float:
     result = a.to(torch.float64).sum().to(torch.float32)
     return result;
 
-# TODO(achal)
-def triton_vectorsum():
-    pass
+def triton_vectorsum(a: torch.Tensor) -> float:
+    @triton.jit
+    def triton_vectorsum_kernel(a_ptr: tl.tensor, result_ptr: tl.tensor, N: int, BLOCK_DIM: tl.constexpr):
+        result: float = 0.
+        for i in range((N + BLOCK_DIM - 1)//BLOCK_DIM):
+            offsets = i*BLOCK_DIM + tl.arange(0, BLOCK_DIM)
+            mask = offsets < N
+            a: tl.tensor = tl.load(a_ptr + offsets, mask)
+            result += tl.sum(a)
+        # How does Triton know that only one thread should do this operation?
+        tl.store(result_ptr, result)
+    
+    grid = lambda metaparams: (1, 1, 1)
+    result = torch.empty(1, device="cuda", dtype=torch.float32)
+    triton_vectorsum_kernel[grid](a, result, a.numel(), BLOCK_DIM=128)
+    return result[0]
 
 # TODO(achal)
 def tinygrad_vectorsum():
@@ -77,9 +92,14 @@ for test_case in test_cases:
     A = (data * scale + offset).contiguous()
     
     result_ref: float = reference_vectorsum(A)
-    # result_triton = triton_vectorsum(A)
+    result_triton = triton_vectorsum(A)
     # result_tinygrad = tinygrad_vectorsum(A)
     result_cuda: float = cuda_vectorsum(A)
+
+    if torch.allclose(result_ref, result_triton):
+        print("Triton: Passed")
+    else:
+        print("Trion: Failed")
 
     if torch.allclose(result_ref, result_cuda):
         print("CUDA: Passed")

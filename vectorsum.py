@@ -30,6 +30,7 @@ def cuda_vectorsum(a: torch.Tensor) -> float:
             name="vectorsum",
             cpp_sources=cpp_source,
             cuda_sources=cuda_source,
+            extra_cuda_cflags=["-DCOMPILING_FROM_PYTORCH"],
             functions=["vectorsum"], verbose=True)
         
         vectorsum_module.vectorsum(a_copy)

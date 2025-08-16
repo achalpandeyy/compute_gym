@@ -96,7 +96,6 @@ def cuda_vectoradd(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """
     cpp_source = """
     #include <torch/extension.h>
-    #include <stdio.h>
 
     void cuda_vectoradd(torch::Tensor a, torch::Tensor b, torch::Tensor c);
     """
@@ -125,16 +124,10 @@ for test_case in test_cases:
     A = torch.randn(size, size, device="cuda", dtype=torch.float16, generator=generator).contiguous()
     B = torch.randn(size, size, device="cuda", dtype=torch.float16, generator=generator).contiguous()
 
-    # A = torch.ones(size, size, device="cuda", dtype=torch.float16).contiguous()
-    # B = torch.ones(size, size, device="cuda", dtype=torch.float16).contiguous()
-
     C_reference = reference_vectoradd(A, B)
     C_triton = triton_vectoradd(A, B)
     # C = tinygrad_vectoradd(A, B)
     C_cuda = cuda_vectoradd(A, B)
-
-    # torch.testing.assert_close(C_triton, C_reference)
-    # print("Triton: Passed")
 
     if torch.allclose(C_triton, C_reference):
         print("Triton: Passed")

@@ -1,7 +1,5 @@
 #include <stdio.h>
 
-// TODO(achal): All of these input params are not necessary, I can
-// deduplicate some of them.
 __global__ void conv2d_kernel(int N, int C_in, int H_in, int W_in, int K_h, int K_w, int C_out, int H_out, int W_out, float *input_tensor, float *kernel, float *output_tensor)
 {
     int tile_dim = blockDim.x;

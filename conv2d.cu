@@ -1,13 +1,20 @@
 #include <stdio.h>
 
+// TODO(achal): All of these input params are not necessary, I can
+// deduplicate some of them.
 __global__ void conv2d_kernel(int N, int C_in, int H_in, int W_in, int K_h, int K_w, int C_out, int H_out, int W_out, float *input_tensor, float *kernel, float *output_tensor)
 {
     int tile_dim = blockDim.x;
     
     int sample = blockIdx.z;
     int out_channel = blockIdx.x;
-    int h = (blockIdx.y/tile_dim)*tile_dim + threadIdx.y;
-    int w = (blockIdx.y%tile_dim)*tile_dim + threadIdx.x;
+
+    int grid_w = (W_out + tile_dim - 1)/tile_dim;
+    int tile_h = blockIdx.y/grid_w;
+    int tile_w = blockIdx.y%grid_w;
+
+    int h = tile_h*tile_dim + threadIdx.y;
+    int w = tile_w*tile_dim + threadIdx.x;
 
     if (h < H_out && w < W_out)
     {
@@ -42,10 +49,11 @@ void conv2d(torch::Tensor input_tensor, torch::Tensor kernel, torch::Tensor outp
     int C_in = input_tensor.size(1);
     int H_in = input_tensor.size(2);
     int W_in = input_tensor.size(3);
+
     int K_h = kernel.size(2);
     int K_w = kernel.size(3);
-    
     int C_out = kernel.size(0);
+
     int H_out = H_in - K_h + 1;
     int W_out = W_in - K_w + 1;
 
@@ -99,14 +107,13 @@ inline static void GetCUDAErrorDetails(cudaError_t error, char const **error_nam
     }\
 }
 #define CUDACheck(fn_call) CUDACheck_(fn_call, __LINE__)
-#endif
 
 int main()
 {
-    int N = 2;
-    int C_in = 3;
-    int H_in = 3;
-    int W_in = 3;
+    int N = 1;
+    int C_in = 16;
+    int H_in = 32;
+    int W_in = 32;
     float *input_tensor = (float *)malloc(N*C_in*H_in*W_in*sizeof(float));
     {
         for (int n = 0; n < N; ++n)
@@ -124,9 +131,9 @@ int main()
             }
         }
     }
-    int C_out = 2;
-    int H_k = 2;
-    int W_k = 2;
+    int C_out = 16;
+    int H_k = 4;
+    int W_k = 4;
     float *kernel = (float *)malloc(C_out*C_in*H_k*W_k*sizeof(float));
     {
         for (int outc = 0; outc < C_out; ++outc)
@@ -253,3 +260,4 @@ int main()
 
     return 0;
 }
+#endif

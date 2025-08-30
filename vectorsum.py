@@ -32,27 +32,25 @@ def cuda_vectorsum(a: torch.Tensor) -> float:
     # NOTE(achal): The reduction algorithm works in place so
     # first copy the Tensor.
     a_copy = a.clone()
+    output = torch.zeros(1, device="cuda", dtype=torch.float32)
 
     cpp_source = """
     #include <torch/extension.h>
 
-    void vectorsum(torch::Tensor a);
+    void Reduce(torch::Tensor input, torch::Tensor output);
     """
-    result = None
-    with open("vectorsum.cu", "r") as f:
+    with open("reduce.cu", "r") as f:
         cuda_source = f.read()
         vectorsum_module = load_inline(
-            name="vectorsum",
+            name="Reduce",
             cpp_sources=cpp_source,
             cuda_sources=cuda_source,
             extra_cuda_cflags=["-DCOMPILING_FROM_PYTORCH"],
-            functions=["vectorsum"], verbose=True)
+            functions=["Reduce"], verbose=True)
         
-        vectorsum_module.vectorsum(a_copy)
-        result = a_copy[0]
+        vectorsum_module.Reduce(a_copy, output)
     
-    assert result
-    return result
+    return output[0]
 
 # https://github.com/gpu-mode/reference-kernels/blob/ee95b29fee216818ab497744265f2197a39b05f7/problems/pmpp_v2/vectorsum_py/task.yml#L24
 test_cases: list[tuple[int, int]] = [

@@ -181,6 +181,9 @@ inline static void GetCUDAErrorDetails(cudaError_t error, char const **error_nam
 }
 #define CUDACheck(fn_call) CUDACheck_(fn_call, __LINE__)
 
+// Dummy kernel for retrieving PTX version.
+__global__ void DummyKernel() {}
+
 __global__ void ReduceKernel1(f32 *input)
 {
     for (int stride = 1; stride <= blockDim.x; stride *= 2)
@@ -194,19 +197,84 @@ __global__ void ReduceKernel1(f32 *input)
     }
 }
 
+__global__ void ReduceKernel2(u32 count, f32 *input, f32 *output)
+{
+    int segment_start = blockIdx.x*(2*blockDim.x);
+    for (int stride = 1; stride <= blockDim.x; stride *= 2)
+    {
+        if ((threadIdx.x % stride) == 0)
+        {
+            int index = segment_start + 2*threadIdx.x;
+            if (index < count)
+            {
+                f32 temp = 0.f;
+                if (index + stride < count)
+                    temp = input[index + stride];
+                input[index] += temp;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0)
+        atomicAdd(output, input[segment_start]);
+}
+
+#if COMPILING_FROM_PYTORCH
+void Reduce(torch::Tensor input, torch::Tensor output)
+{
+    int array_count = input.numel();
+    int block_dim = 1024;
+    int elements_per_block = 2*block_dim;
+    int grid_dim = (array_count + elements_per_block - 1)/(elements_per_block);
+    ReduceKernel2<<<grid_dim, block_dim>>>(array_count, input.data_ptr<f32>(), output.data_ptr<f32>());
+    CUDACheck(cudaDeviceSynchronize());
+}
+#else
 int main()
 {
-    u64 array_count = 2048; // 100000000;
+    if (0)
+    {
+        cudaFuncAttributes attr;
+        CUDACheck(cudaFuncGetAttributes(&attr, DummyKernel));
+
+        int major_ver = attr.ptxVersion/10;
+        int minor_ver = attr.ptxVersion%10;
+        printf("PTX version: %d.%d\n", major_ver, minor_ver);
+
+        int device;
+        CUDACheck(cudaGetDevice(&device));
+
+        cudaDeviceProp device_prop = { 0 };
+        CUDACheck(cudaGetDeviceProperties(&device_prop, device));
+
+        printf("Device name: %s\n", device_prop.name);
+        printf("Compute capability: %d.%d\n", device_prop.major, device_prop.minor);
+        printf("SMs: %d\n", device_prop.multiProcessorCount);
+        // NOTE(achal): Compute capability 7.5 has 64 CUDA cores per SM.
+        printf("CUDA cores: %d\n", device_prop.multiProcessorCount*64);
+        printf("Clock rate: %d KHz\n", device_prop.clockRate); // NOTE(achal): This is deprecated.
+        printf("Total Global Memory: %.2f GB (%llu bytes)\n", (device_prop.totalGlobalMem/(1024.f*1024.f*1024.f)), device_prop.totalGlobalMem);
+        printf("Shared Memory (per block): %.2f KB (%llu bytes)\n", (device_prop.sharedMemPerBlock/1024.f), device_prop.sharedMemPerBlock);
+        printf("Total Constant Memory: %.2f KB (%llu bytes)\n", (device_prop.totalConstMem/1024.f), device_prop.totalConstMem);
+        printf("Warp Size: %d threads\n", device_prop.warpSize);
+        printf("Max threads per block: %d\n", device_prop.maxThreadsPerBlock);
+        printf("Max Block dimension: %dx%dx%d\n", device_prop.maxThreadsDim[0], device_prop.maxThreadsDim[1], device_prop.maxThreadsDim[2]);
+        printf("Max Grid dimension: %dx%dx%d\n", device_prop.maxGridSize[0], device_prop.maxGridSize[1], device_prop.maxGridSize[2]); 
+        printf("32-bit registers (per block): %d\n", device_prop.regsPerBlock);
+    }
+
+    u64 array_count = 100000000;
     f32 *input = (f32 *)malloc(array_count*sizeof(f32));
     for (u64 i = 0; i < array_count; ++i)
         input[i] = 1.f;
 
     u64 elapsed = 0;
-    f32 sum = 0.f;
+    f64 sum = 0.0;
     int rep_count = 10;
     for (int rep = 0; rep < rep_count; ++rep)
     {
-        sum = 0.f;
+        sum = 0.0;
 
         u64 begin_ts = ReadCPUTimer();
         for (u64 i = 0; i < array_count; ++i)
@@ -227,12 +295,21 @@ int main()
     CUDACheck(cudaMalloc(&d_input, array_count*sizeof(f32)));
     CUDACheck(cudaMemcpy(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice));
 
-    ReduceKernel1<<<1, array_count/2>>>(d_input);
+    f32 *d_output = 0;
+    CUDACheck(cudaMalloc(&d_output, sizeof(f32)));
+    CUDACheck(cudaMemset(d_output, 0, sizeof(f32)));
+
+    // ReduceKernel1<<<1, array_count/2>>>(d_input);
+    int block_dim = 1024;
+    int elements_per_block = 2*block_dim;
+    int grid_dim = (array_count + elements_per_block - 1)/(elements_per_block);
+    ReduceKernel2<<<grid_dim, block_dim>>>(array_count, d_input, d_output);
     CUDACheck(cudaDeviceSynchronize());
 
     f32 out = 0.f;
-    CUDACheck(cudaMemcpy(&out, d_input, sizeof(f32), cudaMemcpyDeviceToHost));
+    CUDACheck(cudaMemcpy(&out, d_output, sizeof(f32), cudaMemcpyDeviceToHost));
     printf("GPU: %f\n", out);
 
     return 0;
 }
+#endif

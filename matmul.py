@@ -37,18 +37,18 @@ test_cases: list[tuple[int, int, int, int]] = [
 ]
 
 for test_case in test_cases:
-    m, n, k, seed = test_case
-    print(f"===Test [m: {m}, n: {n}, k: {k}, seed: {seed}]===")
+    i, j, k, seed = test_case
+    print(f"===Test [i: {i}, j: {j}, k: {k}, seed: {seed}]===")
     gen = torch.Generator(device="cuda")
     gen.manual_seed(seed)
 
-    A = torch.empty(m, k, device="cuda", dtype=torch.float16)
-    A.uniform_(0, 1, generator=gen)
-    B = torch.empty(k, n, device="cuda", dtype=torch.float16)
-    B.uniform_(0, 1, generator=gen)
+    M = torch.empty(i, k, device="cuda", dtype=torch.float16)
+    M.uniform_(0, 1, generator=gen)
+    N = torch.empty(k, j, device="cuda", dtype=torch.float16)
+    N.uniform_(0, 1, generator=gen)
     
-    result_ref = reference_matmul(A, B)
-    result_cuda = cuda_matmul(A, B)
+    result_ref = reference_matmul(M, N)
+    result_cuda = cuda_matmul(M, N)
     
     if torch.allclose(result_ref, result_cuda, rtol=1e-3, atol=1e-3):
         print("CUDA: Passed")

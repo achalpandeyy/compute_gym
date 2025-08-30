@@ -147,7 +147,7 @@ static void Test_Reduce()
             float ref = float(array_count);
             if (out == ref)
             {
-                printf("array_count: %llu \tPassed [out: %f, ref: %f]\n", array_count, out, ref);
+                // printf("array_count: %llu \tPassed [out: %f, ref: %f]\n", array_count, out, ref);
             }
         }
 
@@ -182,6 +182,9 @@ int main()
     {
         printf("Device name: %s\n", device_prop.name);
         printf("Compute capability: %d.%d\n", device_prop.major, device_prop.minor);
+        printf("SMs: %d\n", device_prop.multiProcessorCount);
+        // NOTE(achal): Compute capability 7.5 has 64 CUDA cores per SM.
+        printf("CUDA cores: %d\n", device_prop.multiProcessorCount*64);
         printf("Clock rate: %d KHz\n", device_prop.clockRate); // NOTE(achal): This is deprecated.
         printf("Total Global Memory: %.2f GB (%llu bytes)\n", (device_prop.totalGlobalMem/(1024.f*1024.f*1024.f)), device_prop.totalGlobalMem);
         printf("Shared Memory (per block): %.2f KB (%llu bytes)\n", (device_prop.sharedMemPerBlock/1024.f), device_prop.sharedMemPerBlock);

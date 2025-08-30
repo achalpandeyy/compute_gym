@@ -231,6 +231,25 @@ void Reduce(torch::Tensor input, torch::Tensor output)
     CUDACheck(cudaDeviceSynchronize());
 }
 #else
+
+void Reduce1(int count, f32 *input)
+{
+    assert(count <= 2048);
+
+    int block_dim = 1024;
+    int elements_per_block = 2*block_dim;
+    int grid_dim = (count + elements_per_block - 1)/(elements_per_block);
+    ReduceKernel1<<<grid_dim, block_dim>>>(input);
+}
+
+void Reduce2(int count, f32 *input, f32 *output)
+{
+    int block_dim = 1024;
+    int elements_per_block = 2*block_dim;
+    int grid_dim = (count + elements_per_block - 1)/(elements_per_block);
+    ReduceKernel2<<<grid_dim, block_dim>>>(count, input, output);
+}
+
 int main()
 {
     if (0)
@@ -271,7 +290,7 @@ int main()
 
     u64 elapsed = 0;
     f64 sum = 0.0;
-    int rep_count = 10;
+    int rep_count = 20;
     for (int rep = 0; rep < rep_count; ++rep)
     {
         sum = 0.0;
@@ -284,12 +303,11 @@ int main()
         elapsed += end_ts - begin_ts;
     }
 
-    printf("Sum: %f\n", sum);
+    printf("Result (CPU): %f\n", sum);
 
-    f64 elapsed_avg = (f64)elapsed/(f64)rep_count;
     u64 cpu_hz = EstimateCPUTimerFrequency(1000);
-    f64 cpu_elapsed = ((double)elapsed / (double)cpu_hz)*1000.0;
-    printf("CPU elapsed: %f ms\n", cpu_elapsed);
+    f64 cpu_elapsed = ((f64)elapsed / ((f64)cpu_hz*rep_count))*1000.0;
+    printf("Elapsed (CPU): %f ms\n", cpu_elapsed);
 
     f32 *d_input = 0;
     CUDACheck(cudaMalloc(&d_input, array_count*sizeof(f32)));
@@ -299,17 +317,44 @@ int main()
     CUDACheck(cudaMalloc(&d_output, sizeof(f32)));
     CUDACheck(cudaMemset(d_output, 0, sizeof(f32)));
 
-    // ReduceKernel1<<<1, array_count/2>>>(d_input);
-    int block_dim = 1024;
-    int elements_per_block = 2*block_dim;
-    int grid_dim = (array_count + elements_per_block - 1)/(elements_per_block);
-    ReduceKernel2<<<grid_dim, block_dim>>>(array_count, d_input, d_output);
-    CUDACheck(cudaDeviceSynchronize());
+    // Reduce1(array_count, d_input);
+
+    cudaEvent_t start_event, stop_event;
+    CUDACheck(cudaEventCreate(&start_event));
+    CUDACheck(cudaEventCreate(&stop_event));
+
+    // Warmups
+    for (int i = 0; i < 3; ++i)
+    {
+        CUDACheck(cudaMemcpyAsync(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice));
+        CUDACheck(cudaMemsetAsync(d_output, 0, sizeof(f32)));
+        Reduce2(array_count, d_input, d_output);
+    }
+
+    f64 ms = 0;
+    for (int i = 0; i < rep_count; ++i)
+    {
+        CUDACheck(cudaMemcpyAsync(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice));
+        CUDACheck(cudaMemsetAsync(d_output, 0, sizeof(f32)));
+
+        CUDACheck(cudaEventRecord(start_event));
+        Reduce2(array_count, d_input, d_output);
+        CUDACheck(cudaEventRecord(stop_event));
+        CUDACheck(cudaEventSynchronize(stop_event));
+
+        f32 curr_ms;
+        CUDACheck(cudaEventElapsedTime(&curr_ms, start_event, stop_event));
+        ms += curr_ms;
+    }
 
     f32 out = 0.f;
     CUDACheck(cudaMemcpy(&out, d_output, sizeof(f32), cudaMemcpyDeviceToHost));
-    printf("GPU: %f\n", out);
+    printf("Result (GPU): %f\n", out);
 
+    ms /= rep_count;
+    printf("Elapsed (GPU): %f ms\n", ms);
+    printf("Bandwidth: %f GB/s\n", (1000.0*(array_count*sizeof(f32)))/(ms*1024.0*1024.0*1024.0));
+    
     return 0;
 }
 #endif

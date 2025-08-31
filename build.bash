@@ -12,6 +12,7 @@ pushd $build_dir > /dev/null 2>&1
 
 nvcc.exe \
 --use-local-env \
+-lineinfo \
 --generate-code=arch=compute_75,code="[sm_75,compute_75]" \
 -O3 \
 -DNDEBUG \

@@ -220,6 +220,29 @@ __global__ void ReduceKernel2(u32 count, f32 *input, f32 *output)
         atomicAdd(output, input[segment_start]);
 }
 
+__global__ void ReduceKernel3(u32 count, f32 *input, f32 *output)
+{
+    int segment_start = blockIdx.x*(2*blockDim.x);
+    for (int stride = blockDim.x; stride >= 1; stride /= 2)
+    {
+        if (threadIdx.x < stride)
+        {
+            int index = segment_start + threadIdx.x;
+            if (index < count)
+            {
+                f32 temp = 0.f;
+                if (index + stride < count)
+                    temp = input[index + stride];
+                input[index] += temp;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0)
+        atomicAdd(output, input[segment_start]);
+}
+
 #if COMPILING_FROM_PYTORCH
 void Reduce(torch::Tensor input, torch::Tensor output)
 {
@@ -227,7 +250,8 @@ void Reduce(torch::Tensor input, torch::Tensor output)
     int block_dim = 1024;
     int elements_per_block = 2*block_dim;
     int grid_dim = (array_count + elements_per_block - 1)/(elements_per_block);
-    ReduceKernel2<<<grid_dim, block_dim>>>(array_count, input.data_ptr<f32>(), output.data_ptr<f32>());
+    // ReduceKernel2<<<grid_dim, block_dim>>>(array_count, input.data_ptr<f32>(), output.data_ptr<f32>());
+    ReduceKernel3<<<grid_dim, block_dim>>>(array_count, input.data_ptr<f32>(), output.data_ptr<f32>());
     CUDACheck(cudaDeviceSynchronize());
 }
 #else
@@ -248,6 +272,14 @@ void Reduce2(int count, f32 *input, f32 *output)
     int elements_per_block = 2*block_dim;
     int grid_dim = (count + elements_per_block - 1)/(elements_per_block);
     ReduceKernel2<<<grid_dim, block_dim>>>(count, input, output);
+}
+
+void Reduce3(int count, f32 *input, f32 *output)
+{
+    int block_dim = 1024;
+    int elements_per_block = 2*block_dim;
+    int grid_dim = (count + elements_per_block - 1)/(elements_per_block);
+    ReduceKernel3<<<grid_dim, block_dim>>>(count, input, output);
 }
 
 int main()
@@ -337,8 +369,11 @@ int main()
         CUDACheck(cudaMemcpyAsync(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice));
         CUDACheck(cudaMemsetAsync(d_output, 0, sizeof(f32)));
 
+        CUDACheck(cudaStreamSynchronize(0));
+
         CUDACheck(cudaEventRecord(start_event));
-        Reduce2(array_count, d_input, d_output);
+        // Reduce2(array_count, d_input, d_output);
+        Reduce3(array_count, d_input, d_output);
         CUDACheck(cudaEventRecord(stop_event));
         CUDACheck(cudaEventSynchronize(stop_event));
 

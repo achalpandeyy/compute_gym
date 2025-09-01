@@ -1,1 +1,7 @@
 build/
+
+*.bin
+*.png
+
+*.nsys-rep
+*.sqlite

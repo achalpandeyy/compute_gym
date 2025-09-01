@@ -1,62 +1,6 @@
 #include <stdio.h>
-
-#if defined(__clang__)
-#define COMPILER_CLANG 1
-#elif defined(_MSC_VER)
-#define COMPILER_MSVC 1
-#elif defined(__NVCC__)
-#define COMPILER_NVCC
-#else
-#error "Compiler not supported"
-#endif
-
-#if defined(_M_X64) || defined(__x86_64__)
-#define ARCH_X64 1
-#elif defined(__aarch64__)
-#define ARCH_ARM64 1
-#elif defined(__wasm32__)
-#define ARCH_WASM32 1
-#else
-#error "Architecture not supported"
-#endif
-
-#if defined(_WIN32)
-#define PLATFORM_WINDOWS 1
-#elif defined(__linux__)
-#define PLATFORM_LINUX 1
-#elif defined(__APPLE__)
-#define PLATFORM_MACOS 1
-#elif defined(__wasm32__)
-#define PLATFORM_WASM 1
-#else
-#error "Platform not supported"
-#endif
-
-#define KiloBytes(x) (u64)(1024ull*(x))
-#define MegaBytes(x) (u64)(1024ull*KiloBytes(x))
-#define GigaBytes(x) (u64)(1024ull*MegaBytes(x))
-
-#define Minimum(x, y) ((x) < (y) ? (x) : (y))
-#define Maximum(x, y) ((x) > (y) ? (x) : (y))
-#define ArrayCount(x) (sizeof(x)/sizeof((x)[0]))
-
-#define CONCAT_IMPL(a, b) a##b
-#define CONCAT(a, b) CONCAT_IMPL(a, b)
-
-#if PLATFORM_WINDOWS
-#define COBJMACROS
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#endif
-
 #include <stdint.h>
-
-#if !ARCH_WASM32
 #include <assert.h>
-#define Assert assert
-#else
-#define Assert(...)
-#endif
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -72,82 +16,6 @@ typedef int64_t s64;
 
 typedef float f32;
 typedef double f64;
-
-#if PLATFORM_WINDOWS
-inline u64 ReadOSTimer()
-{
-    LARGE_INTEGER large_int;
-    const BOOL retval = QueryPerformanceCounter(&large_int);
-    Assert(retval != 0);
-    u64 result = large_int.QuadPart;
-    return result;
-}
-
-inline u64 GetOSTimerFrequency()
-{
-    LARGE_INTEGER large_int;
-    BOOL retval = QueryPerformanceFrequency(&large_int);
-    Assert(retval != 0);
-    u64 result = large_int.QuadPart;
-    return result;
-}
-#elif PLATFORM_LINUX || PLATFORM_MACOS
-#include <time.h>
-static inline u64 GetOSTimerFrequency()
-{
-    return 1000000000;
-}
-
-static inline u64 ReadOSTimer()
-{
-    struct timespec ts = {0};
-    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-    u64 result = (u64)ts.tv_nsec + ts.tv_sec * 1000000000LL;
-    return result;
-}
-#endif
-
-#if ARCH_X64
-#if PLATFORM_WINDOWS
-#include <intrin.h>
-#elif PLATFORM_LINUX
-#include <x86intrin.h>
-#endif
-static inline u64 ReadCPUTimer()
-{
-    return __rdtsc();
-}
-#elif ARCH_ARM64
-static inline u64 ReadCPUTimer()
-{
-    u64 cntvct;
-    asm volatile ("mrs %0, cntvct_el0; " : "=r"(cntvct) :: "memory");
-    return cntvct;
-}
-#endif
-
-static u64 EstimateCPUTimerFrequency(u64 ms_to_wait)
-{
-    Assert((ms_to_wait % 1000) == 0);
-    u64 os_hz = GetOSTimerFrequency();
-    u64 os_wait_time = (os_hz * (ms_to_wait/1000));
-    
-    u64 os_elapsed = 0;
-    u64 os_begin = ReadOSTimer();
-    
-    u64 cpu_begin = ReadCPUTimer();
-    while (os_elapsed < os_wait_time)
-    {
-        os_elapsed = ReadOSTimer() - os_begin;
-    }
-    u64 cpu_end = ReadCPUTimer();
-    
-    u64 cpu_elapsed = cpu_end - cpu_begin;
-    // Use the invariant: os_elapsed/os_hz == cpu_elapsed/cpu_hz
-    u64 cpu_hz = (os_hz * cpu_elapsed)/os_elapsed;
-    
-    return cpu_hz;
-}
 
 inline static void GetCUDAErrorDetails(cudaError_t error, char const **error_name, char const **error_string)
 {
@@ -183,6 +51,37 @@ inline static void GetCUDAErrorDetails(cudaError_t error, char const **error_nam
 
 // Dummy kernel for retrieving PTX version.
 __global__ void DummyKernel() {}
+
+static void PrintDeviceInfo()
+{
+    cudaFuncAttributes attr;
+    CUDACheck(cudaFuncGetAttributes(&attr, DummyKernel));
+
+    int major_ver = attr.ptxVersion/10;
+    int minor_ver = attr.ptxVersion%10;
+    printf("PTX version: %d.%d\n", major_ver, minor_ver);
+
+    int device;
+    CUDACheck(cudaGetDevice(&device));
+
+    cudaDeviceProp device_prop = { 0 };
+    CUDACheck(cudaGetDeviceProperties(&device_prop, device));
+
+    printf("Device name: %s\n", device_prop.name);
+    printf("Compute capability: %d.%d\n", device_prop.major, device_prop.minor);
+    printf("SMs: %d\n", device_prop.multiProcessorCount);
+    // NOTE(achal): Compute capability 7.5 has 64 CUDA cores per SM.
+    printf("CUDA cores: %d\n", device_prop.multiProcessorCount*64);
+    printf("Clock rate: %d KHz\n", device_prop.clockRate); // NOTE(achal): This is deprecated.
+    printf("Total Global Memory: %.2f GB (%llu bytes)\n", (device_prop.totalGlobalMem/(1024.f*1024.f*1024.f)), device_prop.totalGlobalMem);
+    printf("Shared Memory (per block): %.2f KB (%llu bytes)\n", (device_prop.sharedMemPerBlock/1024.f), device_prop.sharedMemPerBlock);
+    printf("Total Constant Memory: %.2f KB (%llu bytes)\n", (device_prop.totalConstMem/1024.f), device_prop.totalConstMem);
+    printf("Warp Size: %d threads\n", device_prop.warpSize);
+    printf("Max threads per block: %d\n", device_prop.maxThreadsPerBlock);
+    printf("Max Block dimension: %dx%dx%d\n", device_prop.maxThreadsDim[0], device_prop.maxThreadsDim[1], device_prop.maxThreadsDim[2]);
+    printf("Max Grid dimension: %dx%dx%d\n", device_prop.maxGridSize[0], device_prop.maxGridSize[1], device_prop.maxGridSize[2]); 
+    printf("32-bit registers (per block): %d\n", device_prop.regsPerBlock);
+}
 
 __global__ void ReduceKernel1(f32 *input)
 {
@@ -256,6 +155,9 @@ void Reduce(torch::Tensor input, torch::Tensor output)
 }
 #else
 
+#include <cuda_profiler_api.h>
+#include <thrust/reduce.h>
+
 void Reduce1(int count, f32 *input)
 {
     assert(count <= 2048);
@@ -266,130 +168,125 @@ void Reduce1(int count, f32 *input)
     ReduceKernel1<<<grid_dim, block_dim>>>(input);
 }
 
-void Reduce2(int count, f32 *input, f32 *output)
+void Reduce2(int count, f32 *input, f32 *output, cudaStream_t stream)
 {
     int block_dim = 1024;
     int elements_per_block = 2*block_dim;
     int grid_dim = (count + elements_per_block - 1)/(elements_per_block);
-    ReduceKernel2<<<grid_dim, block_dim>>>(count, input, output);
+    ReduceKernel2<<<grid_dim, block_dim, 0, stream>>>(count, input, output);
 }
 
-void Reduce3(int count, f32 *input, f32 *output)
+void Reduce3(int count, f32 *input, f32 *output, cudaStream_t stream)
 {
     int block_dim = 1024;
     int elements_per_block = 2*block_dim;
     int grid_dim = (count + elements_per_block - 1)/(elements_per_block);
-    ReduceKernel3<<<grid_dim, block_dim>>>(count, input, output);
+    ReduceKernel3<<<grid_dim, block_dim, 0, stream>>>(count, input, output);
+}
+
+void Benchmark()
+{
+    int warmup_count = 3;
+    int rep_count = 20;
+
+    FILE *file = fopen("bench_reduce3.bin", "wb");
+    assert(file);
+    for (u32 exp = 1; exp <= 30; ++exp)
+    {
+        u64 array_count = 1 << exp;
+
+        {
+            f32 *input = (f32 *)malloc(array_count*sizeof(f32));
+            for (u64 i = 0; i < array_count; ++i)
+                input[i] = 1.f;
+
+            f32 *d_input = 0;
+            CUDACheck(cudaMalloc(&d_input, array_count*sizeof(f32)));
+            CUDACheck(cudaMemcpy(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice));
+
+            f32 *d_output = 0;
+            CUDACheck(cudaMalloc(&d_output, sizeof(f32)));
+            CUDACheck(cudaMemset(d_output, 0, sizeof(f32)));
+
+            cudaEvent_t start_event, stop_event;
+            CUDACheck(cudaEventCreate(&start_event));
+            CUDACheck(cudaEventCreate(&stop_event));
+
+            cudaStream_t stream;
+            CUDACheck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+
+            // Warmups
+            for (int i = 0; i < warmup_count; ++i)
+            {
+                CUDACheck(cudaMemcpy(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice));
+                CUDACheck(cudaMemset(d_output, 0, sizeof(f32)));
+                // Reduce2(array_count, d_input, d_output, stream);
+                Reduce3(array_count, d_input, d_output, stream);
+                // thrust::reduce_into(thrust::cuda::par.on(stream), d_input, d_input + array_count, d_output, 0.f);
+            }
+
+            f64 ms = 0;
+            for (int i = 0; i < rep_count; ++i)
+            {
+                CUDACheck(cudaMemcpy(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice));
+                CUDACheck(cudaMemset(d_output, 0, sizeof(f32)));
+
+                CUDACheck(cudaEventRecord(start_event, stream));
+                // Reduce1(array_count, d_input);
+                // Reduce2(array_count, d_input, d_output, stream);
+                Reduce3(array_count, d_input, d_output, stream);
+                // thrust::reduce_into(thrust::cuda::par.on(stream), d_input, d_input + array_count, d_output, 0.f);
+                CUDACheck(cudaEventRecord(stop_event, stream));
+                CUDACheck(cudaEventSynchronize(stop_event));
+
+                f32 curr_ms;
+                CUDACheck(cudaEventElapsedTime(&curr_ms, start_event, stop_event));
+                ms += curr_ms;
+            }
+
+            f32 out = 0.f;
+            CUDACheck(cudaMemcpy(&out, d_output, sizeof(f32), cudaMemcpyDeviceToHost));
+
+            bool is_correct = ((int)out == array_count);
+            printf("[%s] Result (GPU): %f\n", is_correct ? "PASS" : "FAIL", out);
+
+            ms /= rep_count;
+
+            f64 bandwidth = (1000.0*(array_count*sizeof(f32)))/(ms*1024.0*1024.0*1024.0);
+
+            fwrite(&array_count, sizeof(u64), 1, file);
+            fwrite(&ms, sizeof(f64), 1, file);
+            fwrite(&bandwidth, sizeof(f64), 1, file);
+
+            printf("Elapsed (GPU): %f ms\n", ms);
+            printf("Bandwidth: %f GB/s\n", bandwidth);
+
+            CUDACheck(cudaStreamDestroy(stream));
+            CUDACheck(cudaEventDestroy(stop_event));
+            CUDACheck(cudaEventDestroy(start_event));
+            CUDACheck(cudaFree(d_output));
+            CUDACheck(cudaFree(d_input));
+            free(input);
+        }   
+    }
+
+    fclose(file);
 }
 
 int main()
 {
+    printf("Thrust version: %d.%d.%d (THRUST_VERSION: %d)\n", THRUST_MAJOR_VERSION, THRUST_MINOR_VERSION, THRUST_SUBMINOR_VERSION, THRUST_VERSION);
+    
     if (0)
     {
-        cudaFuncAttributes attr;
-        CUDACheck(cudaFuncGetAttributes(&attr, DummyKernel));
-
-        int major_ver = attr.ptxVersion/10;
-        int minor_ver = attr.ptxVersion%10;
-        printf("PTX version: %d.%d\n", major_ver, minor_ver);
-
-        int device;
-        CUDACheck(cudaGetDevice(&device));
-
-        cudaDeviceProp device_prop = { 0 };
-        CUDACheck(cudaGetDeviceProperties(&device_prop, device));
-
-        printf("Device name: %s\n", device_prop.name);
-        printf("Compute capability: %d.%d\n", device_prop.major, device_prop.minor);
-        printf("SMs: %d\n", device_prop.multiProcessorCount);
-        // NOTE(achal): Compute capability 7.5 has 64 CUDA cores per SM.
-        printf("CUDA cores: %d\n", device_prop.multiProcessorCount*64);
-        printf("Clock rate: %d KHz\n", device_prop.clockRate); // NOTE(achal): This is deprecated.
-        printf("Total Global Memory: %.2f GB (%llu bytes)\n", (device_prop.totalGlobalMem/(1024.f*1024.f*1024.f)), device_prop.totalGlobalMem);
-        printf("Shared Memory (per block): %.2f KB (%llu bytes)\n", (device_prop.sharedMemPerBlock/1024.f), device_prop.sharedMemPerBlock);
-        printf("Total Constant Memory: %.2f KB (%llu bytes)\n", (device_prop.totalConstMem/1024.f), device_prop.totalConstMem);
-        printf("Warp Size: %d threads\n", device_prop.warpSize);
-        printf("Max threads per block: %d\n", device_prop.maxThreadsPerBlock);
-        printf("Max Block dimension: %dx%dx%d\n", device_prop.maxThreadsDim[0], device_prop.maxThreadsDim[1], device_prop.maxThreadsDim[2]);
-        printf("Max Grid dimension: %dx%dx%d\n", device_prop.maxGridSize[0], device_prop.maxGridSize[1], device_prop.maxGridSize[2]); 
-        printf("32-bit registers (per block): %d\n", device_prop.regsPerBlock);
+        PrintDeviceInfo();
     }
 
-    u64 array_count = 100000000;
-    f32 *input = (f32 *)malloc(array_count*sizeof(f32));
-    for (u64 i = 0; i < array_count; ++i)
-        input[i] = 1.f;
-
-    u64 elapsed = 0;
-    f64 sum = 0.0;
-    int rep_count = 20;
-    for (int rep = 0; rep < rep_count; ++rep)
+    if (1)
     {
-        sum = 0.0;
-
-        u64 begin_ts = ReadCPUTimer();
-        for (u64 i = 0; i < array_count; ++i)
-            sum += input[i];
-        u64 end_ts = ReadCPUTimer();
-        
-        elapsed += end_ts - begin_ts;
+        Benchmark();
     }
 
-    printf("Result (CPU): %f\n", sum);
-
-    u64 cpu_hz = EstimateCPUTimerFrequency(1000);
-    f64 cpu_elapsed = ((f64)elapsed / ((f64)cpu_hz*rep_count))*1000.0;
-    printf("Elapsed (CPU): %f ms\n", cpu_elapsed);
-
-    f32 *d_input = 0;
-    CUDACheck(cudaMalloc(&d_input, array_count*sizeof(f32)));
-    CUDACheck(cudaMemcpy(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice));
-
-    f32 *d_output = 0;
-    CUDACheck(cudaMalloc(&d_output, sizeof(f32)));
-    CUDACheck(cudaMemset(d_output, 0, sizeof(f32)));
-
-    // Reduce1(array_count, d_input);
-
-    cudaEvent_t start_event, stop_event;
-    CUDACheck(cudaEventCreate(&start_event));
-    CUDACheck(cudaEventCreate(&stop_event));
-
-    // Warmups
-    for (int i = 0; i < 3; ++i)
-    {
-        CUDACheck(cudaMemcpyAsync(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice));
-        CUDACheck(cudaMemsetAsync(d_output, 0, sizeof(f32)));
-        Reduce2(array_count, d_input, d_output);
-    }
-
-    f64 ms = 0;
-    for (int i = 0; i < rep_count; ++i)
-    {
-        CUDACheck(cudaMemcpyAsync(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice));
-        CUDACheck(cudaMemsetAsync(d_output, 0, sizeof(f32)));
-
-        CUDACheck(cudaStreamSynchronize(0));
-
-        CUDACheck(cudaEventRecord(start_event));
-        // Reduce2(array_count, d_input, d_output);
-        Reduce3(array_count, d_input, d_output);
-        CUDACheck(cudaEventRecord(stop_event));
-        CUDACheck(cudaEventSynchronize(stop_event));
-
-        f32 curr_ms;
-        CUDACheck(cudaEventElapsedTime(&curr_ms, start_event, stop_event));
-        ms += curr_ms;
-    }
-
-    f32 out = 0.f;
-    CUDACheck(cudaMemcpy(&out, d_output, sizeof(f32), cudaMemcpyDeviceToHost));
-    printf("Result (GPU): %f\n", out);
-
-    ms /= rep_count;
-    printf("Elapsed (GPU): %f ms\n", ms);
-    printf("Bandwidth: %f GB/s\n", (1000.0*(array_count*sizeof(f32)))/(ms*1024.0*1024.0*1024.0));
-    
     return 0;
 }
 #endif

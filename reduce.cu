@@ -2,6 +2,8 @@
 #include <stdint.h>
 #include <assert.h>
 
+#define ArrayCount(array) (sizeof(array)/sizeof(array[0]))
+
 typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
@@ -77,6 +79,8 @@ static void GetPeakMeasurements(f64 *peak_gbps, f64 *peak_gflops, bool print_dev
 
         int peak_clock_freq;
         CUDACheck(cudaDeviceGetAttribute(&peak_clock_freq, cudaDevAttrClockRate, device));
+        
+        // NOTE(achal): 1 FMA is 2 ops.
         *peak_gflops = (sm_count*cuda_cores_per_sm*2.0*peak_clock_freq*1000.0)/1.0e9;
     }
 
@@ -114,73 +118,6 @@ static void GetPeakMeasurements(f64 *peak_gbps, f64 *peak_gflops, bool print_dev
         printf("Max blocks per SM: %d\n", device_prop.maxBlocksPerMultiProcessor);
         printf("Max threads per SM: %d\n", device_prop.maxThreadsPerMultiProcessor);
     }
-}
-
-__global__ void CopyKernel(f32 * __restrict__ input, f32 * __restrict__ output)
-{
-    int index = blockIdx.x*blockDim.x + threadIdx.x;
-    f32 value = input[index];
-    if (threadIdx.x == 0)
-        output[index] = value;
-}
-
-static void BenchmarkCopy()
-{
-    int warmup_count = 3;
-    int rep_count = 20;
-
-    FILE *file = fopen("bench_copy.bin", "wb");
-    assert(file);
-    for (int exp = 1; exp <= 30; ++exp)
-    {
-        u64 array_count = 1 << exp;
-
-        f32 *d_input = 0;
-        CUDACheck(cudaMalloc(&d_input, array_count*sizeof(f32)));
-        f32 *d_output = 0;
-        CUDACheck(cudaMalloc(&d_output, array_count*sizeof(f32)));
-
-        cudaEvent_t start_event, stop_event;
-        CUDACheck(cudaEventCreate(&start_event));
-        CUDACheck(cudaEventCreate(&stop_event));
-
-        int block_dim = 1024;
-        int grid_dim = (array_count + block_dim - 1)/block_dim;
-
-        for (int i = 0; i < warmup_count; ++i)
-        {
-            CopyKernel<<<grid_dim, block_dim>>>(d_input, d_output);
-        }
-
-        f64 ms = 0;
-        for (int i = 0; i < rep_count; ++i)
-        {
-            CUDACheck(cudaEventRecord(start_event));
-            CopyKernel<<<grid_dim, block_dim>>>(d_input, d_output);
-            CUDACheck(cudaEventRecord(stop_event));
-            CUDACheck(cudaEventSynchronize(stop_event));
-
-            f32 curr_ms;
-            CUDACheck(cudaEventElapsedTime(&curr_ms, start_event, stop_event));
-            ms += curr_ms;
-        }
-
-        ms /= rep_count;
-
-        f64 bandwidth = (1000.0*(array_count*sizeof(f32)))/(ms*1024.0*1024.0*1024.0);
-
-        fwrite(&array_count, sizeof(u64), 1, file);
-        fwrite(&ms, sizeof(f64), 1, file);
-        fwrite(&bandwidth, sizeof(f64), 1, file);
-
-        printf("Elapsed (GPU): %f ms\n", ms);
-        printf("Bandwidth: %f GB/s\n", bandwidth);
-
-        CUDACheck(cudaFree(d_output));
-        CUDACheck(cudaFree(d_input));
-    }
-    
-    fclose(file);
 }
 
 __global__ void ReduceKernel1(f32 *input)
@@ -305,24 +242,7 @@ __global__ void ReduceKernel5(u32 count, f32 *input, f32 *output)
         atomicAdd(output, input_s[0]);
 }
 
-#if COMPILING_FROM_PYTORCH
-void Reduce(torch::Tensor input, torch::Tensor output)
-{
-    int array_count = input.numel();
-    int block_dim = 1024;
-    // int elements_per_block = 2*block_dim;
-    int elements_per_block = COARSE_FACTOR*block_dim;
-    int grid_dim = (array_count + elements_per_block - 1)/(elements_per_block);
-    // ReduceKernel2<<<grid_dim, block_dim>>>(array_count, input.data_ptr<f32>(), output.data_ptr<f32>());
-    // ReduceKernel3<<<grid_dim, block_dim>>>(array_count, input.data_ptr<f32>(), output.data_ptr<f32>());
-    // ReduceKernel4<<<grid_dim, block_dim>>>(array_count, input.data_ptr<f32>(), output.data_ptr<f32>());
-    ReduceKernel5<<<grid_dim, block_dim, block_dim*sizeof(f32)>>>(array_count, input.data_ptr<f32>(), output.data_ptr<f32>());
-    CUDACheck(cudaDeviceSynchronize());
-}
-#else
-
-#include <cuda_profiler_api.h>
-#include <thrust/reduce.h>
+typedef void (*ReduceFn)(u32, f32 *, f32 *, cudaStream_t);
 
 void Reduce1(u32 count, f32 *input)
 {
@@ -366,98 +286,163 @@ void Reduce5(u32 count, f32 *input, f32 *output, cudaStream_t stream)
     ReduceKernel5<<<grid_dim, block_dim, block_dim*sizeof(f32), stream>>>(count, input, output);
 }
 
+ReduceFn g_reduce_fns[] =
+{
+    0,
+    0,
+    Reduce2,
+    Reduce3,
+    Reduce4,
+    Reduce5,
+    0,
+};
+
+#if COMPILING_FROM_PYTORCH
+#include <c10/cuda/CUDAStream.h>
+
+void Reduce(torch::Tensor input, torch::Tensor output)
+{
+#ifndef KERNEL_VERSION
+#define KERNEL_VERSION 5
+#endif
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    int array_count = input.numel();
+    f32 *d_input = input.data_ptr<f32>();
+    f32 *d_output = output.data_ptr<f32>();
+
+    ReduceFn Reduce = g_reduce_fns[KERNEL_VERSION];
+    Reduce(array_count, d_input, d_output, stream);
+}
+#else
+
+#include <thrust/reduce.h>
+
 void ThrustReduce(u32 count, f32 *input, f32 *output, cudaStream_t stream)
 {
     thrust::reduce_into(thrust::cuda::par.on(stream), input, input + count, output, 0.f);
 }
 
-typedef void (*ReduceFn)(u32, f32 *, f32 *, cudaStream_t);
+f64 BenchmarkReduce(u64 array_count, ReduceFn Reduce, int *reps)
+{
+    f32 *input = (f32 *)malloc(array_count*sizeof(f32));
+    for (u64 i = 0; i < array_count; ++i)
+        input[i] = 1.f;
+
+    f32 *d_input = 0;
+    CUDACheck(cudaMalloc(&d_input, array_count*sizeof(f32)));
+    CUDACheck(cudaMemcpy(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice));
+
+    f32 *d_output = 0;
+    CUDACheck(cudaMalloc(&d_output, sizeof(f32)));
+    CUDACheck(cudaMemset(d_output, 0, sizeof(f32)));
+
+    // NOTE(achal): Make sure we are not waiting on the default stream for anything.
+    cudaStream_t stream;
+    CUDACheck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+
+    cudaEvent_t start_event, stop_event;
+    CUDACheck(cudaEventCreate(&start_event));
+    CUDACheck(cudaEventCreate(&stop_event));
+
+    // Correctness check
+    {
+        CUDACheck(cudaMemcpy(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice));
+        CUDACheck(cudaMemset(d_output, 0, sizeof(f32)));
+        Reduce(array_count, d_input, d_output, stream);
+
+        f32 out = 0.f;
+        CUDACheck(cudaMemcpy(&out, d_output, sizeof(f32), cudaMemcpyDeviceToHost));
+
+        bool is_correct = ((int)out == array_count);
+        printf("[%s] Result (GPU): %f\n", is_correct ? "PASS" : "FAIL", out);    
+    }
+
+    f64 duration_ms[20];
+    int max_reps = ArrayCount(duration_ms);
+    int max_benchmarking_ms = 120*1000;
+
+    f64 ms_mean = 0.0;
+    int rep = 0;
+    for (; rep < max_reps; ++rep)
+    {
+        CUDACheck(cudaMemcpy(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice));
+        CUDACheck(cudaMemset(d_output, 0, sizeof(f32)));
+
+        CUDACheck(cudaEventRecord(start_event, stream));
+        Reduce(array_count, d_input, d_output, stream);
+        CUDACheck(cudaEventRecord(stop_event, stream));
+        CUDACheck(cudaEventSynchronize(stop_event));
+
+        f32 ms;
+        CUDACheck(cudaEventElapsedTime(&ms, start_event, stop_event));
+        duration_ms[rep] = (f64)ms;
+
+        if (rep > 0)
+        {
+            int sample_count = rep + 1;
+            for (int i = 0; i < sample_count; ++i)
+                ms_mean += duration_ms[i];
+            ms_mean /= sample_count;
+
+            f64 stddev = 0.0;
+            for (int i = 0; i < sample_count; ++i)
+                stddev += (duration_ms[i] - ms_mean)*(duration_ms[i] - ms_mean);
+            stddev /= rep - 1; // Bessel's correction
+            stddev = sqrt(stddev);
+
+            f64 sem = stddev/sqrt(sample_count);
+
+            // NOTE(achal): Inspired by:
+            // https://github.com/gpu-mode/reference-kernels/blob/750868c61cd81fdcec8826a0cfcf4cb7fea064da/problems/pmpp_v2/eval.py#L237
+            // We only exit if any of these is true:
+            // 1) Exceed the maximum number of repeats.
+            // 2) Exceed the maximum benchmarking time.
+            // 3) Sample mean is within 0.01% of population mean i.e. SEM < 0.001.
+            if (sem < 0.001 || rep >= max_reps || ms_mean*sample_count > max_benchmarking_ms)
+                break;
+        }
+    }
+
+    if (reps)
+        *reps = rep;
+
+    CUDACheck(cudaEventDestroy(stop_event));
+    CUDACheck(cudaEventDestroy(start_event));
+    CUDACheck(cudaStreamDestroy(stream));
+    CUDACheck(cudaFree(d_output));
+    CUDACheck(cudaFree(d_input));
+    free(input);
+
+    return ms_mean;
+}
 
 void Benchmark(ReduceFn Reduce, f64 peak_gbps, f64 peak_gflops, const char *file_name)
 {
-    int warmup_count = 3;
-    int rep_count = 20;
-
     FILE *file = fopen(file_name, "wb");
     assert(file);
 
+    b8 metadata_present = 1;
+    fwrite(&metadata_present, sizeof(b8), 1, file);
+    
     fwrite(&peak_gbps, sizeof(f64), 1, file);
     fwrite(&peak_gflops, sizeof(f64), 1, file);
+
+    // Warmup
+    (void)BenchmarkReduce(1 << 18, Reduce, 0);
 
     for (u32 exp = 1; exp <= 30; ++exp)
     {
         u64 array_count = 1 << exp;
+        int reps = 0;
+        f64 ms = BenchmarkReduce(array_count, Reduce, &reps);
+        f64 bandwidth = (1000.0*(array_count*sizeof(f32)))/(ms*1024.0*1024.0*1024.0);
 
-        {
-            f32 *input = (f32 *)malloc(array_count*sizeof(f32));
-            for (u64 i = 0; i < array_count; ++i)
-                input[i] = 1.f;
+        fwrite(&array_count, sizeof(u64), 1, file);
+        fwrite(&ms, sizeof(f64), 1, file);
+        fwrite(&bandwidth, sizeof(f64), 1, file);
 
-            f32 *d_input = 0;
-            CUDACheck(cudaMalloc(&d_input, array_count*sizeof(f32)));
-            CUDACheck(cudaMemcpy(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice));
-
-            f32 *d_output = 0;
-            CUDACheck(cudaMalloc(&d_output, sizeof(f32)));
-            CUDACheck(cudaMemset(d_output, 0, sizeof(f32)));
-
-            cudaEvent_t start_event, stop_event;
-            CUDACheck(cudaEventCreate(&start_event));
-            CUDACheck(cudaEventCreate(&stop_event));
-
-            cudaStream_t stream;
-            CUDACheck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-
-            // Warmups
-            for (int i = 0; i < warmup_count; ++i)
-            {
-                CUDACheck(cudaMemcpy(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice));
-                CUDACheck(cudaMemset(d_output, 0, sizeof(f32)));
-                Reduce(array_count, d_input, d_output, stream);
-            }
-
-            f64 ms = 0;
-            for (int i = 0; i < rep_count; ++i)
-            {
-                CUDACheck(cudaMemcpy(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice));
-                CUDACheck(cudaMemset(d_output, 0, sizeof(f32)));
-
-                // CUDACheck(cudaProfilerStart());
-                CUDACheck(cudaEventRecord(start_event, stream));
-                Reduce(array_count, d_input, d_output, stream);
-                CUDACheck(cudaEventRecord(stop_event, stream));
-                CUDACheck(cudaEventSynchronize(stop_event));
-                // CUDACheck(cudaProfilerStop());
-
-                f32 curr_ms;
-                CUDACheck(cudaEventElapsedTime(&curr_ms, start_event, stop_event));
-                ms += curr_ms;
-            }
-
-            f32 out = 0.f;
-            CUDACheck(cudaMemcpy(&out, d_output, sizeof(f32), cudaMemcpyDeviceToHost));
-
-            bool is_correct = ((int)out == array_count);
-            printf("[%s] Result (GPU): %f\n", is_correct ? "PASS" : "FAIL", out);
-
-            ms /= rep_count;
-
-            f64 bandwidth = (1000.0*(array_count*sizeof(f32)))/(ms*1024.0*1024.0*1024.0);
-
-            fwrite(&array_count, sizeof(u64), 1, file);
-            fwrite(&ms, sizeof(f64), 1, file);
-            fwrite(&bandwidth, sizeof(f64), 1, file);
-
-            printf("Elapsed (GPU): %f ms\n", ms);
-            printf("Bandwidth: %f GB/s\n", bandwidth);
-
-            CUDACheck(cudaStreamDestroy(stream));
-            CUDACheck(cudaEventDestroy(stop_event));
-            CUDACheck(cudaEventDestroy(start_event));
-            CUDACheck(cudaFree(d_output));
-            CUDACheck(cudaFree(d_input));
-            free(input);
-        }   
+        printf("Elapsed (GPU): %f ms [%d]\n", ms, reps);
+        printf("Bandwidth: %f GB/s\n", bandwidth);  
     }
 
     fclose(file);
@@ -475,12 +460,6 @@ int main(int argc, char **argv)
 
     printf("Thrust version: %d.%d.%d (THRUST_VERSION: %d)\n", THRUST_MAJOR_VERSION, THRUST_MINOR_VERSION, THRUST_SUBMINOR_VERSION, THRUST_VERSION);
 
-    if (0)
-    {
-        BenchmarkCopy();
-        printf("Done\n");
-    }
-
     if (1)
     {
         if (argc != 2)
@@ -492,16 +471,7 @@ int main(int argc, char **argv)
         int benchmark_index = atoi(argv[1]);
         printf("Benchmark index: %d\n", benchmark_index);
 
-        ReduceFn reduce_fns[] =
-        {
-            0,
-            0,
-            Reduce2,
-            Reduce3,
-            Reduce4,
-            Reduce5,
-            ThrustReduce,
-        };
+        g_reduce_fns[6] = ThrustReduce;
 
         const char *file_names[] =
         {
@@ -514,7 +484,7 @@ int main(int argc, char **argv)
             "bench_reduce_thrust.bin",
         };
 
-        ReduceFn Reduce = reduce_fns[benchmark_index];
+        ReduceFn Reduce = g_reduce_fns[benchmark_index];
         const char *file_name = file_names[benchmark_index];
         Benchmark(Reduce, peak_gbps, peak_gflops, file_name);
     }

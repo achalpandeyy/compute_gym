@@ -1,5 +1,4 @@
 import math
-import time
 import struct
 from typing import Callable
 from types import ModuleType
@@ -10,9 +9,9 @@ from torch.utils.cpp_extension import load_inline
 import triton
 import triton.language as tl
 
-def reference_vectorsum(a: torch.Tensor) -> float:
-    result = a.to(torch.float64).sum().to(torch.float32)
-    return result;
+def reference_vectorsum(input: torch.Tensor, output: torch.Tensor) -> None:
+    result = input.sum()
+    output[0] = result
 
 def triton_vectorsum_(input: torch.Tensor, output: torch.Tensor) -> None:
     @triton.jit
@@ -48,6 +47,7 @@ def load_cuda_vectorsum() -> ModuleType:
             name="Reduce",
             cpp_sources=cpp_source,
             cuda_sources=cuda_source,
+            extra_include_paths=["."],
             extra_cuda_cflags=["-DCOMPILING_FROM_PYTORCH", f"-DREDUCE_KERNEL_VERSION={KERNEL_VERSION}"],
             functions=["Reduce"], verbose=True)
 
@@ -102,7 +102,9 @@ def benchmark_reduce(
     reduce(input, output)
     torch.cuda.synchronize()
 
-    result_ref: float = reference_vectorsum(input)
+    result_ref = torch.zeros(1, device="cuda", dtype=torch.float32)
+    reference_vectorsum(input, result_ref)
+    
     if torch.allclose(output, result_ref):
         print(f"[PASS] Result (GPU): {output}")
     else:
@@ -165,7 +167,7 @@ def benchmark(
             print(f"Elapsed (GPU): {ms} ms [{reps}]")
             print(f"Bandwidth: {bandwidth} GBPS")
 
-benchmark(triton_vectorsum, f"bench_vectorsum_triton.bin")
+# benchmark(triton_vectorsum, f"bench_vectorsum_triton.bin")
 # benchmark(vectorsum_module.Reduce, f"bench_vectorsum_{KERNEL_VERSION}.bin")
 
 # https://github.com/gpu-mode/reference-kernels/blob/ee95b29fee216818ab497744265f2197a39b05f7/problems/pmpp_v2/vectorsum_py/task.yml#L24
@@ -193,7 +195,8 @@ for test_case in test_cases:
     result_triton = torch.zeros(1, device="cuda", dtype=torch.float32)
     triton_vectorsum(input, result_triton)
     
-    result_ref: float = reference_vectorsum(input)
+    result_ref = torch.zeros(1, device="cuda", dtype=torch.float32)
+    reference_vectorsum(input, result_ref)
 
     if torch.allclose(result_ref, result_triton):
         print("Triton: Passed")
@@ -223,7 +226,7 @@ if False:
 
         vectorsum_module: ModuleType = load_cuda_vectorsum()
 
-        ms, reps = benchmark_reduce(vectorsum_module, size, seed)
+        ms, reps = benchmark_reduce(vectorsum_module.Reduce, size, seed)
         print(f"Elapsed: {ms} ms [{reps}]")
         bandwidth = (1000.0*(size*torch.float32.itemsize))/(ms*1024.0*1024.0*1024.0)
         print(f"Bandwidth: {bandwidth} GBPS")

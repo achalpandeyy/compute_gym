@@ -1,124 +1,4 @@
-#include <stdio.h>
-#include <stdint.h>
-#include <assert.h>
-
-#define ArrayCount(array) (sizeof(array)/sizeof(array[0]))
-
-typedef uint8_t u8;
-typedef uint16_t u16;
-typedef uint32_t u32;
-typedef uint64_t u64;
-
-typedef u8 b8;
-typedef u32 b32;
-
-typedef int16_t s16;
-typedef int32_t s32;
-typedef int64_t s64;
-
-typedef float f32;
-typedef double f64;
-
-inline static void GetCUDAErrorDetails(cudaError_t error, char const **error_name, char const **error_string)
-{
-    if (error_name)
-        *error_name = cudaGetErrorName(error);
-    
-    if (error_string)
-        *error_string = cudaGetErrorString(error);
-}
-
-#define CUDACheck_(fn_call, line)\
-{\
-    cudaError_t prev_error = cudaGetLastError();\
-    while (prev_error != cudaSuccess)\
-    {\
-        char const *error_name = 0;\
-        char const *error_string = 0;\
-        GetCUDAErrorDetails(prev_error, &error_name, &error_string);\
-        printf("[ERROR]: CUDA Runtime already had an error: %s %s", error_name, error_string);\
-        prev_error = cudaGetLastError();\
-    }\
-    fn_call;\
-    cudaError_t error = cudaGetLastError();\
-    if (error != cudaSuccess)\
-    {\
-        char const *error_name = 0;\
-        char const *error_string = 0;\
-        GetCUDAErrorDetails(error, &error_name, &error_string);\
-        printf("CUDA Error on line %u: %s %s", line, error_name, error_string);\
-    }\
-}
-#define CUDACheck(fn_call) CUDACheck_(fn_call, __LINE__)
-
-// Dummy kernel for retrieving PTX version.
-__global__ void DummyKernel() {}
-
-static void GetPeakMeasurements(f64 *peak_gbps, f64 *peak_gflops, bool print_device_info = false)
-{
-    cudaFuncAttributes attr;
-    CUDACheck(cudaFuncGetAttributes(&attr, DummyKernel));
-
-    int major_ver = attr.ptxVersion/10;
-    int minor_ver = attr.ptxVersion%10;
-    
-    int device;
-    CUDACheck(cudaGetDevice(&device));
-
-    cudaDeviceProp device_prop = { 0 };
-    CUDACheck(cudaGetDeviceProperties(&device_prop, device));
-    
-    // Peak GFLOPS
-    {
-        int sm_count;
-        CUDACheck(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
-
-        // NOTE(achal): Compute capability 7.5 has 64 CUDA cores per SM.
-        assert(device_prop.major == 7 && device_prop.minor == 5);
-        int cuda_cores_per_sm = 64;
-
-        int peak_clock_freq;
-        CUDACheck(cudaDeviceGetAttribute(&peak_clock_freq, cudaDevAttrClockRate, device));
-        
-        // NOTE(achal): 1 FMA is 2 ops.
-        *peak_gflops = (sm_count*cuda_cores_per_sm*2.0*peak_clock_freq*1000.0)/1.0e9;
-    }
-
-    // Peak GBPS
-    {
-        int peak_mem_clock_freq;
-        CUDACheck(cudaDeviceGetAttribute(&peak_mem_clock_freq, cudaDevAttrMemoryClockRate, device));
-
-        int bus_width;
-        CUDACheck(cudaDeviceGetAttribute(&bus_width, cudaDevAttrGlobalMemoryBusWidth, device));
-
-        printf("Peak memory clock frequency: %d kHz\n", peak_mem_clock_freq);
-        printf("Bus width: %d bits\n", bus_width);
-
-        // NOTE(achal): 2.0 is for double transfer (DDR).
-        *peak_gbps = (peak_mem_clock_freq*1000.0*2.0)*(bus_width/8.0)/(1024.0*1024.0*1024.0);
-    }
-
-    if (print_device_info)
-    {
-        printf("Device name: %s\n", device_prop.name);
-        printf("Compute capability: %d.%d\n", device_prop.major, device_prop.minor);
-        printf("PTX version: %d.%d\n", major_ver, minor_ver);
-
-        printf("Total Global Memory: %.2f GB\n", (device_prop.totalGlobalMem/(1024.f*1024.f*1024.f)));
-        printf("Shared Memory (per block): %.2f KB\n", (device_prop.sharedMemPerBlock/1024.f));
-        printf("Total Constant Memory: %.2f KB\n", (device_prop.totalConstMem/1024.f));
-
-        printf("Warp Size: %d threads\n", device_prop.warpSize);
-        printf("Max threads per block: %d\n", device_prop.maxThreadsPerBlock);
-        printf("Max Block dimension: %dx%dx%d\n", device_prop.maxThreadsDim[0], device_prop.maxThreadsDim[1], device_prop.maxThreadsDim[2]);
-        printf("Max Grid dimension: %dx%dx%d\n", device_prop.maxGridSize[0], device_prop.maxGridSize[1], device_prop.maxGridSize[2]); 
-        printf("32-bit registers (per block): %d\n", device_prop.regsPerBlock);
-        printf("SM count: %d\n", device_prop.multiProcessorCount);
-        printf("Max blocks per SM: %d\n", device_prop.maxBlocksPerMultiProcessor);
-        printf("Max threads per SM: %d\n", device_prop.maxThreadsPerMultiProcessor);
-    }
-}
+#include "common.cuh"
 
 __global__ void ReduceKernel1(f32 *input)
 {
@@ -354,7 +234,8 @@ f64 BenchmarkReduce(u64 array_count, ReduceFn Reduce, int *reps)
         CUDACheck(cudaMemcpy(&out, d_output, sizeof(f32), cudaMemcpyDeviceToHost));
 
         bool is_correct = ((int)out == array_count);
-        printf("[%s] Result (GPU): %f\n", is_correct ? "PASS" : "FAIL", out);    
+        assert(is_correct);
+        // printf("[%s] Result (GPU): %f\n", is_correct ? "PASS" : "FAIL", out);    
     }
 
     f64 duration_ms[20];
@@ -430,7 +311,7 @@ void Benchmark(ReduceFn Reduce, f64 peak_gbps, f64 peak_gflops, const char *file
     // Warmup
     (void)BenchmarkReduce(1 << 18, Reduce, 0);
 
-    for (u32 exp = 1; exp <= 30; ++exp)
+    for (u32 exp = 30; exp <= 30; ++exp)
     {
         u64 array_count = 1 << exp;
         int reps = 0;
@@ -442,7 +323,7 @@ void Benchmark(ReduceFn Reduce, f64 peak_gbps, f64 peak_gflops, const char *file
         fwrite(&bandwidth, sizeof(f64), 1, file);
 
         printf("Elapsed (GPU): %f ms [%d]\n", ms, reps);
-        printf("Bandwidth: %f GB/s\n", bandwidth);  
+        // printf("Bandwidth: %f GB/s\n", bandwidth);  
     }
 
     fclose(file);
@@ -450,44 +331,39 @@ void Benchmark(ReduceFn Reduce, f64 peak_gbps, f64 peak_gflops, const char *file
 
 int main(int argc, char **argv)
 {
+    if (argc != 2)
+    {
+        printf("Usage: %s <benchmark_index>\n", argv[0]);
+        return 1;
+    }
+    
+    int benchmark_index = atoi(argv[1]);
+    // printf("Benchmark index: %d\n", benchmark_index);
+
+    g_reduce_fns[6] = ThrustReduce;
+
+    const char *file_names[] =
+    {
+        0,
+        0,
+        "bench_reduce2.bin",
+        "bench_reduce3.bin",
+        "bench_reduce4.bin",
+        "bench_reduce5.bin",
+        "bench_reduce_thrust.bin",
+    };
+
     f64 peak_gbps = 0.0;
     f64 peak_gflops = 0.0;
-    GetPeakMeasurements(&peak_gbps, &peak_gflops, true);
+    GetPeakMeasurements(&peak_gbps, &peak_gflops, false);
 
-    printf("Peak bandwidth: %.2f GBPS\n", peak_gbps);
-    printf("Peak throughput: %.2f GFLOPS\n", peak_gflops);
-    printf("Peak arithmetic intensity: %.2f FLOPS/byte\n", peak_gflops/peak_gbps);
+    // printf("Peak bandwidth: %.2f GBPS\n", peak_gbps);
+    // printf("Peak throughput: %.2f GFLOPS\n", peak_gflops);
+    // printf("Peak arithmetic intensity: %.2f FLOPS/byte\n", peak_gflops/peak_gbps);
 
-    printf("Thrust version: %d.%d.%d (THRUST_VERSION: %d)\n", THRUST_MAJOR_VERSION, THRUST_MINOR_VERSION, THRUST_SUBMINOR_VERSION, THRUST_VERSION);
-
-    if (1)
-    {
-        if (argc != 2)
-        {
-            printf("Usage: %s <benchmark_index>\n", argv[0]);
-            return 1;
-        }
-        
-        int benchmark_index = atoi(argv[1]);
-        printf("Benchmark index: %d\n", benchmark_index);
-
-        g_reduce_fns[6] = ThrustReduce;
-
-        const char *file_names[] =
-        {
-            0,
-            0,
-            "bench_reduce2.bin",
-            "bench_reduce3.bin",
-            "bench_reduce4.bin",
-            "bench_reduce5.bin",
-            "bench_reduce_thrust.bin",
-        };
-
-        ReduceFn Reduce = g_reduce_fns[benchmark_index];
-        const char *file_name = file_names[benchmark_index];
-        Benchmark(Reduce, peak_gbps, peak_gflops, file_name);
-    }
+    ReduceFn Reduce = g_reduce_fns[benchmark_index];
+    const char *file_name = file_names[benchmark_index];
+    Benchmark(Reduce, peak_gbps, peak_gflops, file_name);
 
     return 0;
 }

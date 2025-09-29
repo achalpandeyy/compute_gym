@@ -20,9 +20,8 @@ nvcc.exe \
 -lineinfo \
 --generate-code=arch=compute_75,code="[sm_75,compute_75]" \
 -O3 \
--DNDEBUG \
 -Xptxas=-v \
--Xcompiler "/std:c++17 /O2 /Oi /Ot /DNDEBUG" \
+-Xcompiler "/std:c++17 /O2 /Oi /Ot" \
 ../"${target}".cu \
 -o "${target}".exe
 

@@ -226,16 +226,17 @@ f64 BenchmarkReduce(u64 array_count, ReduceFn Reduce, int *reps)
 
     // Correctness check
     {
-        CUDACheck(cudaMemcpy(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice));
-        CUDACheck(cudaMemset(d_output, 0, sizeof(f32)));
+        CUDACheck(cudaMemcpyAsync(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice, stream));
+        CUDACheck(cudaMemsetAsync(d_output, 0, sizeof(f32), stream));
         Reduce(array_count, d_input, d_output, stream);
 
         f32 out = 0.f;
-        CUDACheck(cudaMemcpy(&out, d_output, sizeof(f32), cudaMemcpyDeviceToHost));
+        CUDACheck(cudaMemcpyAsync(&out, d_output, sizeof(f32), cudaMemcpyDeviceToHost, stream));
+        CUDACheck(cudaStreamSynchronize(stream));
 
         bool is_correct = ((int)out == array_count);
         assert(is_correct);
-        // printf("[%s] Result (GPU): %f\n", is_correct ? "PASS" : "FAIL", out);    
+        printf("[%s] Result (GPU): %f\n", is_correct ? "PASS" : "FAIL", out);    
     }
 
     f64 duration_ms[20];
@@ -246,8 +247,8 @@ f64 BenchmarkReduce(u64 array_count, ReduceFn Reduce, int *reps)
     int rep = 0;
     for (; rep < max_reps; ++rep)
     {
-        CUDACheck(cudaMemcpy(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice));
-        CUDACheck(cudaMemset(d_output, 0, sizeof(f32)));
+        CUDACheck(cudaMemcpyAsync(d_input, input, array_count*sizeof(f32), cudaMemcpyHostToDevice, stream));
+        CUDACheck(cudaMemsetAsync(d_output, 0, sizeof(f32), stream));
 
         CUDACheck(cudaEventRecord(start_event, stream));
         Reduce(array_count, d_input, d_output, stream);
@@ -311,7 +312,7 @@ void Benchmark(ReduceFn Reduce, f64 peak_gbps, f64 peak_gflops, const char *file
     // Warmup
     (void)BenchmarkReduce(1 << 18, Reduce, 0);
 
-    for (u32 exp = 30; exp <= 30; ++exp)
+    for (u32 exp = 1; exp <= 30; ++exp)
     {
         u64 array_count = 1 << exp;
         int reps = 0;
@@ -338,7 +339,7 @@ int main(int argc, char **argv)
     }
     
     int benchmark_index = atoi(argv[1]);
-    // printf("Benchmark index: %d\n", benchmark_index);
+    printf("Benchmark index: %d\n", benchmark_index);
 
     g_reduce_fns[6] = ThrustReduce;
 
@@ -355,11 +356,11 @@ int main(int argc, char **argv)
 
     f64 peak_gbps = 0.0;
     f64 peak_gflops = 0.0;
-    GetPeakMeasurements(&peak_gbps, &peak_gflops, false);
+    GetPeakMeasurements(&peak_gbps, &peak_gflops, true);
 
-    // printf("Peak bandwidth: %.2f GBPS\n", peak_gbps);
-    // printf("Peak throughput: %.2f GFLOPS\n", peak_gflops);
-    // printf("Peak arithmetic intensity: %.2f FLOPS/byte\n", peak_gflops/peak_gbps);
+    printf("Peak bandwidth: %.2f GBPS\n", peak_gbps);
+    printf("Peak throughput: %.2f GFLOPS\n", peak_gflops);
+    printf("Peak arithmetic intensity: %.2f FLOPS/byte\n", peak_gflops/peak_gbps);
 
     ReduceFn Reduce = g_reduce_fns[benchmark_index];
     const char *file_name = file_names[benchmark_index];

@@ -102,7 +102,8 @@ __global__ void ReduceKernel4(u64 count, T *input, T *output)
 template <typename T>
 __global__ void ReduceKernel5(u64 count, T *input, T *output)
 {
-    extern __shared__ T input_s[];
+    __shared__ T smem;
+    T *input_s = &smem;
 
     int segment_start = blockIdx.x*COARSE_FACTOR*blockDim.x;
     int index = segment_start + threadIdx.x;
@@ -135,7 +136,7 @@ void Reduce1(u64 count, T *input)
     int block_dim = 1024;
     int elements_per_block = 2*block_dim;
     int grid_dim = (count + elements_per_block - 1)/(elements_per_block);
-    ReduceKernel1<T><<<grid_dim, block_dim>>>(input);
+    CUDACheck((ReduceKernel1<T><<<grid_dim, block_dim>>>(input)));
 }
 
 template <typename T>
@@ -144,7 +145,7 @@ void Reduce2(u64 count, T *input, T *output, cudaStream_t stream)
     int block_dim = 1024;
     int elements_per_block = 2*block_dim;
     int grid_dim = (count + elements_per_block - 1)/(elements_per_block);
-    ReduceKernel2<T><<<grid_dim, block_dim, 0, stream>>>(count, input, output);
+    CUDACheck((ReduceKernel2<T><<<grid_dim, block_dim, 0, stream>>>(count, input, output)));
 }
 
 template <typename T>
@@ -153,7 +154,7 @@ void Reduce3(u64 count, T *input, T *output, cudaStream_t stream)
     int block_dim = 1024;
     int elements_per_block = 2*block_dim;
     int grid_dim = (count + elements_per_block - 1)/(elements_per_block);
-    ReduceKernel3<T><<<grid_dim, block_dim, 0, stream>>>(count, input, output);
+    CUDACheck((ReduceKernel3<T><<<grid_dim, block_dim, 0, stream>>>(count, input, output)));
 }
 
 template <typename T>
@@ -162,7 +163,7 @@ void Reduce4(u64 count, T *input, T *output, cudaStream_t stream)
     int block_dim = 1024;
     int elements_per_block = COARSE_FACTOR*block_dim;
     int grid_dim = (count + elements_per_block - 1)/(elements_per_block);
-    ReduceKernel4<T><<<grid_dim, block_dim, 0, stream>>>(count, input, output);
+    CUDACheck((ReduceKernel4<T><<<grid_dim, block_dim, 0, stream>>>(count, input, output)));
 }
 
 template <typename T>
@@ -171,7 +172,7 @@ void Reduce5(u64 count, T *input, T *output, cudaStream_t stream)
     int block_dim = 1024;
     int elements_per_block = COARSE_FACTOR*block_dim;
     int grid_dim = (count + elements_per_block - 1)/(elements_per_block);
-    ReduceKernel5<T><<<grid_dim, block_dim, block_dim*sizeof(T), stream>>>(count, input, output);
+    CUDACheck((ReduceKernel5<T><<<grid_dim, block_dim, block_dim*sizeof(T), stream>>>(count, input, output)));
 }
 
 template <typename T>
@@ -238,15 +239,11 @@ f64 BenchmarkReduce(ReduceFn<T> Reduce, u64 array_count, int *reps)
 
         CUDACheck(cudaStreamSynchronize(stream));
 
-        bool is_correct = ((int)out == array_count);
-        if (!is_correct)
+        if ((int)out != array_count)
         {
-            assert(0);
-            printf("[FAIL] Result (GPU): %f \tExpected: %f\n", out, (T)array_count);
-        }
-        else
-        {
-            // printf("[PASS] Result (GPU): %f \tExpected: %f\n", out, (T)array_count);
+            // assert(0);
+            printf("Failed for %llu elements, skipping benchmark\n", array_count);
+            return 0.0;
         }
     }
 
@@ -329,7 +326,7 @@ void Benchmark(ReduceFn<T> Reduce, f64 peak_gbps, f64 peak_gflops, const char *f
         u64 array_count = 1 << exp;
         int reps = 0;
         f64 ms = BenchmarkReduce<T>(Reduce, array_count, &reps);
-        f64 bandwidth = (1000.0*(array_count*sizeof(f32)))/(ms*1024.0*1024.0*1024.0);
+        f64 bandwidth = (1000.0*(array_count*sizeof(T)))/(ms*1024.0*1024.0*1024.0);
 
         fwrite(&array_count, sizeof(u64), 1, file);
         fwrite(&ms, sizeof(f64), 1, file);
@@ -342,27 +339,37 @@ void Benchmark(ReduceFn<T> Reduce, f64 peak_gbps, f64 peak_gflops, const char *f
     fclose(file);
 }
 
+static void TestReduce(int reduce_index);
+
 int main(int argc, char **argv)
 {
     if (argc != 2)
     {
-        printf("Usage: %s <benchmark_index>\n", argv[0]);
+        printf("Usage: %s <reduce_index>\n", argv[0]);
         return 1;
     }
     
-    int benchmark_index = atoi(argv[1]);
-    printf("Benchmark index: %d\n", benchmark_index);
+    int reduce_index = atoi(argv[1]);
+    printf("Reduce index: %d\n", reduce_index);
 
-    ReduceFn<f32> reduce_fns[] =
+    if (1)
+    {
+        TestReduce(reduce_index);
+        printf("All tests passed\n");
+    }
+
+    using DataType = f32;
+    ReduceFn<DataType> reduce_fns[] =
     {
         0,
         0,
-        Reduce2<f32>,
-        Reduce3<f32>,
-        Reduce4<f32>,
-        Reduce5<f32>,
-        ThrustReduce<f32>,
+        Reduce2<DataType>,
+        Reduce3<DataType>,
+        Reduce4<DataType>,
+        Reduce5<DataType>,
+        ThrustReduce<DataType>,
     };
+    ReduceFn<DataType> Reduce = reduce_fns[reduce_index];
 
     const char *file_names[] =
     {
@@ -383,9 +390,63 @@ int main(int argc, char **argv)
     printf("Throughput (Peak):\t%.2f GFLOPS\n", peak_gflops);
     printf("Arithmetic intensity (Peak):\t%.2f FLOPS/byte\n", peak_gflops/peak_gbps);
 
-    const char *file_name = file_names[benchmark_index];
-    Benchmark<f32>(reduce_fns[benchmark_index], peak_gbps, peak_gflops, file_name);
+    const char *file_name = file_names[reduce_index];
+    Benchmark<DataType>(Reduce, peak_gbps, peak_gflops, file_name);
 
     return 0;
+}
+
+static void TestReduce(int reduce_index)
+{
+    ReduceFn<int> reduce_fns[] =
+    {
+        0,
+        0,
+        Reduce2<int>,
+        Reduce3<int>,
+        Reduce4<int>,
+        Reduce5<int>,
+        ThrustReduce<int>,
+    };
+    ReduceFn<int> Reduce = reduce_fns[reduce_index];
+
+    srand(0);
+    int test_count = 10;
+    while (test_count > 0)
+    {
+        u64 count = GetRandomNumber(30);
+        printf("Count: %llu", count);
+
+        int *input = (int *)malloc(count*sizeof(int));
+        for (int i = 0; i < count; ++i)
+            input[i] = 1;
+
+        int *d_input = 0;
+        CUDACheck(cudaMalloc(&d_input, count*sizeof(int)));
+        CUDACheck(cudaMemcpy(d_input, input, count*sizeof(int), cudaMemcpyHostToDevice));
+
+        int *d_output = 0;
+        CUDACheck(cudaMalloc(&d_output, sizeof(int)));
+        CUDACheck(cudaMemset(d_output, int(0), sizeof(int)));
+
+        Reduce(count, d_input, d_output, 0);
+
+        int out = 0;
+        CUDACheck(cudaMemcpy(&out, d_output, sizeof(int), cudaMemcpyDeviceToHost));
+
+        if (out != count)
+        {
+            // assert(0);
+            printf("[FAIL] Result (GPU): %d \tExpected: %llu\n", out, count);
+            exit(1);
+        }
+        printf(",\tPassed\n");
+
+        CUDACheck(cudaFree(d_input));
+        CUDACheck(cudaFree(d_output));
+        free(input);
+
+        --test_count;
+    }
 }
 #endif

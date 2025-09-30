@@ -1,11 +1,14 @@
 #ifndef COMMON_CUH
 #define COMMON_CUH
 
+#define ArrayCount(array) (sizeof(array)/sizeof(array[0]))
+#define Minimum(x, y) ((x) < (y) ? (x) : (y))
+
 #include <stdio.h>
 #include <stdint.h>
-#include <assert.h>
 
-#define ArrayCount(array) (sizeof(array)/sizeof(array[0]))
+#include <assert.h>
+#define Assert assert
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -21,6 +24,29 @@ typedef int64_t s64;
 
 typedef float f32;
 typedef double f64;
+
+inline static u64 GetRandomNumber(u32 max_bits)
+{
+    // This value is implementation dependent. It's guaranteed that this value is at least 32767.
+    // https://en.cppreference.com/w/c/numeric/random/RAND_MAX.html
+    Assert(RAND_MAX >= 32767);
+
+    u64 result = 0;
+    s32 bits_left = max_bits - 1;
+    while (bits_left > 0)
+    {
+        s32 bits_to_add = Minimum(14, bits_left);
+        u32 mask = (1 << bits_to_add) - 1;
+        
+        u32 x = (u32)rand() & mask;
+        result |= (x << (max_bits - 1 - bits_left));
+        
+        bits_left -= bits_to_add;
+    }
+
+    Assert(result < (1ull << max_bits));
+    return result;
+}
 
 inline static void GetCUDAErrorDetails(cudaError_t error, char const **error_name, char const **error_string)
 {

@@ -54,12 +54,12 @@ reduce4_data = load_benchmark_data("bench_reduce4.bin")
 reduce5_data = load_benchmark_data("bench_reduce5.bin")
 thrust_data = load_benchmark_data("bench_reduce_thrust.bin")
 
-vectorsum5_data = load_benchmark_data("bench_vectorsum_5.bin")
-vectorsum_triton_data = load_benchmark_data("bench_vectorsum_triton.bin")
+# vectorsum5_data = load_benchmark_data("bench_vectorsum_5.bin")
+# vectorsum_triton_data = load_benchmark_data("bench_vectorsum_triton.bin")
 
 # assert reduce2_data.peak_gbps == reduce3_data.peak_gbps == reduce4_data.peak_gbps == reduce5_data.peak_gbps == thrust_data.peak_gbps
 # assert reduce2_data.peak_gflops == reduce3_data.peak_gflops == reduce4_data.peak_gflops == reduce5_data.peak_gflops == thrust_data.peak_gflops
-assert reduce2_data.element_counts == reduce3_data.element_counts == reduce4_data.element_counts == reduce5_data.element_counts == thrust_data.element_counts
+# assert reduce2_data.element_counts == reduce3_data.element_counts == reduce4_data.element_counts == reduce5_data.element_counts == thrust_data.element_counts
 element_counts = reduce2_data.element_counts
 bandwidth_values = reduce2_data.bandwidth_values
 
@@ -84,23 +84,23 @@ ax.set_yticks([start_y + i*h for i in range(len(element_counts))])
 plt.grid(True, alpha=0.3)  # Add grid with transparency
 plt.gca().set_facecolor('black')  # Set plot background to black
 
-if reduce3_data.peak_gbps is not None:
-    plt.hlines(reduce3_data.peak_gbps, reduce3_data.element_counts[0], reduce3_data.element_counts[-1], colors="red", linestyles="dashed", linewidth=1)
-
-plt.plot(thrust_data.element_counts, thrust_data.bandwidth_values, color='cyan', linewidth=2)
-plt.plot(reduce2_data.element_counts, reduce2_data.bandwidth_values, color='yellow', linewidth=1)
-plt.plot(reduce3_data.element_counts, reduce3_data.bandwidth_values, color='lime', linewidth=1)
-plt.plot(reduce4_data.element_counts, reduce4_data.bandwidth_values, color='orange', linewidth=1)
-plt.plot(reduce5_data.element_counts, reduce5_data.bandwidth_values, color='magenta', linewidth=1)
-plt.plot(vectorsum5_data.element_counts, vectorsum5_data.bandwidth_values, color='white', linewidth=1)
-plt.plot(vectorsum_triton_data.element_counts, vectorsum_triton_data.bandwidth_values, color='blue', linewidth=1)
+if reduce2_data.peak_gbps is not None:
+    plt.hlines(reduce2_data.peak_gbps, reduce2_data.element_counts[0], reduce2_data.element_counts[-1], colors="red", linestyles="dashed", linewidth=1)
+breakpoint()
+plt.plot(thrust_data.element_counts, thrust_data.bandwidth_values, color='green', linewidth=2)
+# plt.plot(reduce2_data.element_counts, reduce2_data.bandwidth_values, color='cyan', linewidth=1)
+# plt.plot(reduce3_data.element_counts, reduce3_data.bandwidth_values, color='cyan', linewidth=1)
+# plt.plot(reduce4_data.element_counts, reduce4_data.bandwidth_values, color='cyan', linewidth=1)
+plt.plot(reduce5_data.element_counts, reduce5_data.bandwidth_values, color='cyan', linewidth=1)
+# plt.plot(vectorsum5_data.element_counts, vectorsum5_data.bandwidth_values, color='white', linewidth=1)
+# plt.plot(vectorsum_triton_data.element_counts, vectorsum_triton_data.bandwidth_values, color='blue', linewidth=1)
 
 plt.legend([
     "Peak",
     "Thrust",
-    "Reduce2",
-    "Reduce3",
-    "Reduce4",
+    # "Reduce2",
+    # "Reduce3",
+    # "Reduce4",
     "Reduce5",
     "vectorsum5",
     "vectorsum_triton"], 

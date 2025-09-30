@@ -54,17 +54,27 @@ inline static void GetCUDAErrorDetails(cudaError_t error, char const **error_nam
 }
 #define CUDACheck(...) CUDACheck_(__VA_ARGS__, __LINE__)
 
-// Dummy kernel for retrieving PTX version.
-__global__ void DummyKernel() {}
+static inline u32 GetCUDACoresPerSM(int major, int minor)
+{
+    if (major == 7 && minor == 5)
+    {
+        return 64;
+    }
+    else if (major == 8 && minor == 9)
+    {
+        return 128;
+    }
+    else
+    {
+        printf("Unsupported compute capability: %d.%d\n", major, minor);
+        assert(0);
+    }
+
+    return 0;
+}
 
 static void GetPeakMeasurements(f64 *peak_gbps, f64 *peak_gflops, bool print_device_info = false)
 {
-    cudaFuncAttributes attr;
-    CUDACheck(cudaFuncGetAttributes(&attr, DummyKernel));
-
-    int major_ver = attr.ptxVersion/10;
-    int minor_ver = attr.ptxVersion%10;
-    
     int device;
     CUDACheck(cudaGetDevice(&device));
 
@@ -76,9 +86,7 @@ static void GetPeakMeasurements(f64 *peak_gbps, f64 *peak_gflops, bool print_dev
         int sm_count;
         CUDACheck(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
 
-        // NOTE(achal): Compute capability 7.5 has 64 CUDA cores per SM.
-        assert(device_prop.major == 7 && device_prop.minor == 5);
-        int cuda_cores_per_sm = 64;
+        int cuda_cores_per_sm = GetCUDACoresPerSM(device_prop.major, device_prop.minor);
 
         int peak_clock_freq;
         CUDACheck(cudaDeviceGetAttribute(&peak_clock_freq, cudaDevAttrClockRate, device));
@@ -92,6 +100,8 @@ static void GetPeakMeasurements(f64 *peak_gbps, f64 *peak_gflops, bool print_dev
         int peak_mem_clock_freq;
         CUDACheck(cudaDeviceGetAttribute(&peak_mem_clock_freq, cudaDevAttrMemoryClockRate, device));
 
+        printf("Peak memory clock frequency: %d kHz\n", peak_mem_clock_freq);
+
         int bus_width;
         CUDACheck(cudaDeviceGetAttribute(&bus_width, cudaDevAttrGlobalMemoryBusWidth, device));
 
@@ -103,7 +113,6 @@ static void GetPeakMeasurements(f64 *peak_gbps, f64 *peak_gflops, bool print_dev
     {
         printf("Device name: %s\n", device_prop.name);
         printf("Compute capability: %d.%d\n", device_prop.major, device_prop.minor);
-        printf("PTX version: %d.%d\n", major_ver, minor_ver);
 
         printf("Total Global Memory: %.2f GB\n", (device_prop.totalGlobalMem/(1024.f*1024.f*1024.f)));
         printf("Shared Memory (per block): %.2f KB\n", (device_prop.sharedMemPerBlock/1024.f));

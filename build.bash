@@ -14,7 +14,9 @@ virtual_arch="compute_89"
 real_arch="sm_89"
 
 # NOTE(achal): Passing -DNDEBUG to nvcc.exe disables host side asserts as well.
- 
+
+../../../tools/ctime/ctime.exe -begin .${target}.ctm
+
 nvcc.exe \
 -I "../../../cccl/" \
 -I "../../../cccl/libcudacxx/include" \
@@ -28,5 +30,7 @@ nvcc.exe \
 -Xcompiler "/std:c++17 /O2 /Oi /Ot /Zi /Zc:preprocessor" \
 ../"${target}".cu \
 -o "${target}".exe
+
+../../../tools/ctime/ctime.exe -end .${target}.ctm $?
 
 popd > /dev/null 2>&1

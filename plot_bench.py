@@ -1,32 +1,36 @@
 import math
 import struct
+import sys
 import matplotlib.pyplot as plt
 
 class BenchmarkData:
     def __init__(
         self,
+        file_name: str,
         peak_gbps: float | None,
         peak_gflops: float | None,
         element_counts: list[int],
         ms_values: list[float],
         bandwidth_values: list[float]):
+        self.file_name = file_name
         self.peak_gbps = peak_gbps
         self.peak_gflops = peak_gflops
         self.element_counts = element_counts
         self.ms_values = ms_values
         self.bandwidth_values = bandwidth_values
 
+    file_name: str
     peak_gbps: float | None
     peak_gflops: float | None
     element_counts: list[int]
     ms_values: list[float]
     bandwidth_values: list[float]
 
-def load_benchmark_data(file_path: str) -> BenchmarkData:
+def load_benchmark_data(file_name: str) -> BenchmarkData:
     element_counts = []
     ms_values = []
     bandwidth_values = []
-    with open(file_path, "rb") as file:
+    with open(file_name, "rb") as file:
         peak_gbps = None
         peak_gflops = None
         metadata_present = struct.unpack("b", file.read(1))[0]
@@ -46,25 +50,40 @@ def load_benchmark_data(file_path: str) -> BenchmarkData:
             bandwidth_values.append(struct.unpack(record_format, chunk)[2])
 
     assert len(element_counts) == len(ms_values) == len(bandwidth_values)
-    return BenchmarkData(peak_gbps, peak_gflops, element_counts, ms_values, bandwidth_values)
+    return BenchmarkData(file_name, peak_gbps, peak_gflops, element_counts, ms_values, bandwidth_values)
 
-reduce2_data = load_benchmark_data("bench_reduce2.bin")
-reduce3_data = load_benchmark_data("bench_reduce3.bin")
-reduce4_data = load_benchmark_data("bench_reduce4.bin")
-reduce5_data = load_benchmark_data("bench_reduce5.bin")
-thrust_data = load_benchmark_data("bench_reduce_thrust.bin")
+if len(sys.argv) <= 1:
+    print("Usage: python plot_bench.py benchmark file(s)...")
+    sys.exit(1)
 
-# vectorsum5_data = load_benchmark_data("bench_vectorsum_5.bin")
-# vectorsum_triton_data = load_benchmark_data("bench_vectorsum_triton.bin")
+benchmark_files = sys.argv[1:]
 
-# assert reduce2_data.peak_gbps == reduce3_data.peak_gbps == reduce4_data.peak_gbps == reduce5_data.peak_gbps == thrust_data.peak_gbps
-# assert reduce2_data.peak_gflops == reduce3_data.peak_gflops == reduce4_data.peak_gflops == reduce5_data.peak_gflops == thrust_data.peak_gflops
-# assert reduce2_data.element_counts == reduce3_data.element_counts == reduce4_data.element_counts == reduce5_data.element_counts == thrust_data.element_counts
-element_counts = reduce2_data.element_counts
-bandwidth_values = reduce2_data.bandwidth_values
+benchmark_datas = []
+element_counts: list[int] | None = None
+peak_gbps: float | None = None
+peak_gflops: float | None = None
+for benchmark_file in benchmark_files:
+    benchmark_datas.append(load_benchmark_data(benchmark_file))
+
+    if element_counts:  
+        assert element_counts == benchmark_datas[-1].element_counts
+    else:
+        element_counts = benchmark_datas[-1].element_counts
+    if peak_gbps:
+        assert peak_gbps == benchmark_datas[-1].peak_gbps
+    else:
+        peak_gbps = benchmark_datas[-1].peak_gbps
+    if peak_gflops:
+        assert peak_gflops == benchmark_datas[-1].peak_gflops
+    else:
+        peak_gflops = benchmark_datas[-1].peak_gflops
+
+assert element_counts
+assert peak_gbps
+assert peak_gflops
 
 # Draw plot
-plt.title("Reduce Bandwidth")
+plt.title("Bandwidth")
 fig, ax = plt.subplots(figsize=(15, 8))
 
 x_range = math.log2(element_counts[-1]) - math.log2(element_counts[0])
@@ -84,26 +103,18 @@ ax.set_yticks([start_y + i*h for i in range(len(element_counts))])
 plt.grid(True, alpha=0.3)  # Add grid with transparency
 plt.gca().set_facecolor('black')  # Set plot background to black
 
-if reduce2_data.peak_gbps is not None:
-    plt.hlines(reduce2_data.peak_gbps, reduce2_data.element_counts[0], reduce2_data.element_counts[-1], colors="red", linestyles="dashed", linewidth=1)
-breakpoint()
-plt.plot(thrust_data.element_counts, thrust_data.bandwidth_values, color='green', linewidth=2)
-# plt.plot(reduce2_data.element_counts, reduce2_data.bandwidth_values, color='cyan', linewidth=1)
-# plt.plot(reduce3_data.element_counts, reduce3_data.bandwidth_values, color='cyan', linewidth=1)
-# plt.plot(reduce4_data.element_counts, reduce4_data.bandwidth_values, color='cyan', linewidth=1)
-plt.plot(reduce5_data.element_counts, reduce5_data.bandwidth_values, color='cyan', linewidth=1)
-# plt.plot(vectorsum5_data.element_counts, vectorsum5_data.bandwidth_values, color='white', linewidth=1)
-# plt.plot(vectorsum_triton_data.element_counts, vectorsum_triton_data.bandwidth_values, color='blue', linewidth=1)
+if peak_gbps:
+    plt.hlines(peak_gbps, element_counts[0], element_counts[-1], colors="red", linestyles="dashed", linewidth=1)
+
+legend_entries = []
+for benchmark_data in benchmark_datas:
+    plt.plot(benchmark_data.element_counts, benchmark_data.bandwidth_values, linewidth=2)
+    legend_entries.append(benchmark_data.file_name)
 
 plt.legend([
     "Peak",
-    "Thrust",
-    # "Reduce2",
-    # "Reduce3",
-    # "Reduce4",
-    "Reduce5",
-    "vectorsum5",
-    "vectorsum_triton"], 
+    *legend_entries,
+], 
     bbox_to_anchor=(1.05, 1), loc='upper left')
 
 plt.tight_layout()

@@ -270,7 +270,7 @@ static void TestReduce(int reduce_index);
 
 int main(int argc, char **argv)
 {
-    if (argc != 2)
+    if (argc < 2 || argc > 3)
     {
         printf("Usage: %s <reduce_index>\n", argv[0]);
         return 1;
@@ -278,6 +278,12 @@ int main(int argc, char **argv)
     
     int reduce_index = atoi(argv[1]);
     printf("Reduce index: %d\n", reduce_index);
+
+    char *file_name = 0;
+    if (argc == 3)
+    {
+        file_name = argv[2];
+    }
 
     if (1)
     {
@@ -297,17 +303,6 @@ int main(int argc, char **argv)
     };
     g_Reduce = reduce_fns[reduce_index];
 
-    const char *file_names[] =
-    {
-        0,
-        0,
-        "bench_reduce2.bin",
-        "bench_reduce3.bin",
-        "bench_reduce4.bin",
-        "bench_reduce5.bin",
-        "bench_reduce_thrust.bin",
-    };
-
     f64 peak_gbps = 0.0;
     f64 peak_gflops = 0.0;
     GetPeakMeasurements(&peak_gbps, &peak_gflops, true);
@@ -316,7 +311,6 @@ int main(int argc, char **argv)
     printf("Throughput (Peak):\t%.2f GFLOPS\n", peak_gflops);
     printf("Arithmetic intensity (Peak):\t%.2f FLOPS/byte\n", peak_gflops/peak_gbps);
 
-    const char *file_name = file_names[reduce_index];
     Benchmark<InputType>(peak_gbps, peak_gflops, file_name);
 
     return 0;

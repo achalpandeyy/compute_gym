@@ -218,8 +218,14 @@ static void FunctionToBenchmark(Data<T> *data, cudaStream_t stream)
 
 static void TestScan();
 
-int main()
+int main(int argc, char **argv)
 {
+    char *file_name = 0;
+    if (argc == 2)
+    {
+        file_name = argv[1];
+    }
+
     if (1)
     {
         TestScan();
@@ -234,7 +240,7 @@ int main()
     printf("Throughput (Peak):\t%.2f GFLOPS\n", peak_gflops);
     printf("Arithmetic intensity (Peak):\t%.2f FLOPS/byte\n", peak_gflops/peak_gbps);
 
-    Benchmark<InputType>(peak_gbps, peak_gflops, "bench_scan.bin");
+    Benchmark<InputType>(peak_gbps, peak_gflops, file_name);
 
     return 0;
 }

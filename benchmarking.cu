@@ -38,15 +38,19 @@ static void FlushL2Cache()
 template <typename T>
 void Benchmark(f64 peak_gbps, f64 peak_gflops, const char *file_name)
 {
-    FILE *file = fopen(file_name, "wb");
-    assert(file);
+    FILE *file = 0;
+    if (file_name)
+        file = fopen(file_name, "wb");
 
-    b8 metadata_present = 1;
-    fwrite(&metadata_present, sizeof(b8), 1, file);
+    if (file)
+    {
+        b8 metadata_present = 1;
+        fwrite(&metadata_present, sizeof(b8), 1, file);
+        
+        fwrite(&peak_gbps, sizeof(f64), 1, file);
+        fwrite(&peak_gflops, sizeof(f64), 1, file);
+    }
     
-    fwrite(&peak_gbps, sizeof(f64), 1, file);
-    fwrite(&peak_gflops, sizeof(f64), 1, file);
-
     // Warmup
     {
         Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
@@ -107,9 +111,7 @@ void Benchmark(f64 peak_gbps, f64 peak_gflops, const char *file_name)
                     Scratch data_scratch = ScratchBegin(scratch.arena);
                     Data<T> *data = CreateData<T>(data_scratch.arena, array_count, stream);
                     
-                    // NOTE(achal): We don't need to flush the L2 cache as long as
-                    // we are creating and destroying the data for every rep.
-                    // FlushL2Cache();
+                    FlushL2Cache();
                     CUDACheck(cudaEventRecord(start_event, stream));
                     FunctionToBenchmark(data, stream);
                     CUDACheck(cudaEventRecord(stop_event, stream));
@@ -149,9 +151,12 @@ void Benchmark(f64 peak_gbps, f64 peak_gflops, const char *file_name)
 
             f64 bandwidth = (1000.0*(array_count*sizeof(T)))/(ms_mean*1024.0*1024.0*1024.0);
 
-            fwrite(&array_count, sizeof(u64), 1, file);
-            fwrite(&ms_mean, sizeof(f64), 1, file);
-            fwrite(&bandwidth, sizeof(f64), 1, file);
+            if (file)
+            {
+                fwrite(&array_count, sizeof(u64), 1, file);
+                fwrite(&ms_mean, sizeof(f64), 1, file);
+                fwrite(&bandwidth, sizeof(f64), 1, file);
+            }
 
             printf("Array count: %llu\n", array_count);
             printf("Elapsed (GPU): %f ms [%d]\n", ms_mean, rep);
@@ -165,5 +170,6 @@ void Benchmark(f64 peak_gbps, f64 peak_gflops, const char *file_name)
         }          
     }
 
-    fclose(file);
+    if (file)
+        fclose(file);
 }

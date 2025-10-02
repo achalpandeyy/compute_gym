@@ -14,7 +14,7 @@ virtual_arch="compute_89"
 real_arch="sm_89"
 
 # NOTE(achal): Passing -DNDEBUG to nvcc.exe disables host side asserts as well.
-
+ 
 nvcc.exe \
 -I "../../../cccl/" \
 -I "../../../cccl/libcudacxx/include" \
@@ -25,7 +25,7 @@ nvcc.exe \
 -lineinfo \
 --generate-code=arch=${virtual_arch},code="[${real_arch},${virtual_arch}]" \
 -O3 \
--Xcompiler "/std:c++17 /O2 /Oi /Ot /Zc:preprocessor" \
+-Xcompiler "/std:c++17 /O2 /Oi /Ot /Zi /Zc:preprocessor" \
 ../"${target}".cu \
 -o "${target}".exe
 

@@ -1,29 +1,7 @@
 #ifndef COMMON_CUH
 #define COMMON_CUH
 
-#define ArrayCount(array) (sizeof(array)/sizeof(array[0]))
-#define Minimum(x, y) ((x) < (y) ? (x) : (y))
-
 #include <stdio.h>
-#include <stdint.h>
-
-#include <assert.h>
-#define Assert assert
-
-typedef uint8_t u8;
-typedef uint16_t u16;
-typedef uint32_t u32;
-typedef uint64_t u64;
-
-typedef u8 b8;
-typedef u32 b32;
-
-typedef int16_t s16;
-typedef int32_t s32;
-typedef int64_t s64;
-
-typedef float f32;
-typedef double f64;
 
 inline static u64 GetRandomNumber(u32 max_bits)
 {
@@ -143,6 +121,7 @@ static void GetPeakMeasurements(f64 *peak_gbps, f64 *peak_gflops, bool print_dev
         printf("Total Global Memory: %.2f GB\n", (device_prop.totalGlobalMem/(1024.f*1024.f*1024.f)));
         printf("Shared Memory (per block): %.2f KB\n", (device_prop.sharedMemPerBlock/1024.f));
         printf("Total Constant Memory: %.2f KB\n", (device_prop.totalConstMem/1024.f));
+        printf("L2 Cache Size: %.2f KB\n", (device_prop.l2CacheSize/1024.f));
 
         printf("Warp Size: %d threads\n", device_prop.warpSize);
         printf("Max threads per block: %d\n", device_prop.maxThreadsPerBlock);

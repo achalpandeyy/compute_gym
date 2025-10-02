@@ -1,3 +1,5 @@
+#include "core_types.h"
+#include "core_memory.h"
 #include "common.cuh"
 
 template <typename T>
@@ -195,10 +197,10 @@ void Reduce(torch::Tensor input, torch::Tensor output)
     Reduce(array_count, d_input, d_output, stream);
 }
 #else
-#include <thrust/reduce.h>
 
 #include "benchmarking.cu"
 
+#include <thrust/reduce.h>
 using InputType = f32;
 
 static ReduceFn<InputType> g_Reduce = 0;
@@ -219,9 +221,12 @@ struct Data
 };
 
 template <typename T>
-static void CreateData(Data<T> *data, cudaStream_t stream)
+static Data<T> *CreateData(Arena *arena, u64 count, cudaStream_t stream)
 {
-    data->h_in = (T *)malloc(data->count*sizeof(*data->h_in));
+    Data<T> *data = PushStruct(arena, Data<T>);
+    data->count = count;
+
+    data->h_in = PushArray(arena, T, data->count);
     for (u64 i = 0; i < data->count; ++i)
         data->h_in[i] = T(1);
 
@@ -232,6 +237,8 @@ static void CreateData(Data<T> *data, cudaStream_t stream)
     CUDACheck(cudaMemsetAsync(data->d_out, T(0), sizeof(*data->d_out), stream));
 
     CUDACheck(cudaStreamSynchronize(stream));
+
+    return data;
 }
 
 template <typename T>
@@ -239,12 +246,10 @@ static void DestroyData(Data<T> *data)
 {
     CUDACheck(cudaFree(data->d_in));
     CUDACheck(cudaFree(data->d_out));
-
-    free(data->h_in);
 }
 
 template <typename T>
-static b32 ValidateGPUOutput(Data<T> *data)
+static b32 ValidateGPUOutput(Arena *arena, Data<T> *data)
 {
     T out = T(0);
     CUDACheck(cudaMemcpy(&out, data->d_out, sizeof(*data->d_out), cudaMemcpyDeviceToHost));
@@ -335,23 +340,23 @@ static void TestReduce(int reduce_index)
     int test_count = 10;
     while (test_count > 0)
     {
+        Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
+
         u64 count = GetRandomNumber(30);
         printf("Count: %llu", count);
 
-        Data<int> data;
-        data.count = count;
-        CreateData(&data, 0);
+        Data<int> *data = CreateData<int>(scratch.arena, count, 0);
+        Reduce(count, data->d_in, data->d_out, 0);
 
-        Reduce(count, data.d_in, data.d_out, 0);
-
-        if (!ValidateGPUOutput<int>(&data))
+        if (!ValidateGPUOutput<int>(scratch.arena, data))
         {
             // assert(0);
             exit(1);
         }
         printf(",\tPassed\n");
 
-        DestroyData(&data);
+        DestroyData<int>(data);
+        ScratchEnd(&scratch);
 
         --test_count;
     }

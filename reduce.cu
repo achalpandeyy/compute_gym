@@ -201,8 +201,8 @@ void Reduce(torch::Tensor input, torch::Tensor output)
 #include "benchmarking.cu"
 
 #include <thrust/reduce.h>
-using InputType = f32;
 
+using InputType = f32;
 static ReduceFn<InputType> g_Reduce = 0;
 
 template <typename T>

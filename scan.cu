@@ -49,8 +49,9 @@ __device__ T BlockScan2(T *block)
 {
     for (int stride = 1; stride < blockDim.x; stride *= 2)
     {
-        if (((threadIdx.x + 1) % (2*stride)) == 0)
-            block[threadIdx.x] += block[threadIdx.x - stride];
+        int index = 2*stride*(threadIdx.x + 1) - 1;
+        if (index < blockDim.x)
+            block[index] += block[index - stride];
         __syncthreads();
     }
 

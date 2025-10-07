@@ -45,6 +45,27 @@ __device__ T BlockScan1(T *block)
 }
 
 template <typename T>
+__device__ T BlockScan2(T *block)
+{
+    for (int stride = 1; stride < blockDim.x; stride *= 2)
+    {
+        if (((threadIdx.x + 1) % (2*stride)) == 0)
+            block[threadIdx.x] += block[threadIdx.x - stride];
+        __syncthreads();
+    }
+
+    for (int stride = blockDim.x/4; stride >= 1; stride /= 2)
+    {
+        int index = 2*stride*(threadIdx.x + 1) - 1;
+        if (index + stride < blockDim.x)
+            block[index + stride] += block[index];
+        __syncthreads();
+    }
+
+    return block[threadIdx.x];
+}
+
+template <typename T>
 __global__ void InclusiveScanUpsweep(u64 count, T *array, T *summary)
 {
     __shared__ T segment[SEGMENT_SIZE];
@@ -56,7 +77,8 @@ __global__ void InclusiveScanUpsweep(u64 count, T *array, T *summary)
         segment[threadIdx.x] = T(0);
     __syncthreads();
 
-    T scan_result = BlockScan1(segment);
+    // T scan_result = BlockScan1(segment);
+    T scan_result = BlockScan2(segment);
 
     if (index < count)
         array[index] = scan_result;
@@ -335,7 +357,6 @@ static void TestScan()
     int test_count = 10;
     while (test_count > 0)
     {
-        
         u64 count = GetRandomNumber(30);
         printf("Count: %llu:\t", count);
         

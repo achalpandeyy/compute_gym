@@ -54,6 +54,7 @@ __global__ void InclusiveScanUpsweep(u64 count, T *array, T *summary)
         segment[threadIdx.x] = array[index];
     else
         segment[threadIdx.x] = T(0);
+    __syncthreads();
 
     T scan_result = BlockScan1(segment);
 

@@ -24,8 +24,6 @@ static void SequentialExclusiveScan(int count, T *array)
     }
 }
 
-#define SEGMENT_SIZE 1024
-
 template <typename T>
 __device__ T BlockScan1(T *block)
 {   
@@ -66,69 +64,134 @@ __device__ T BlockScan2(T *block)
     return block[threadIdx.x];
 }
 
-template <typename T>
-__device__ T BlockScan3(T *block)
-{
-    for (int stride = 1; stride < blockDim.x; stride *= 2)
-    {
-        int index = (threadIdx.x + 1)*2*stride - 1;
-        if (index < blockDim.x)
-            block[index] += block[index - stride];
-        __syncthreads();
-    }
+#define BLOCK_DIM 512
+#define COARSE_FACTOR 8
+#define ELEMENTS_PER_THREAD (2*COARSE_FACTOR)
+#define ELEMENTS_PER_BLOCK (ELEMENTS_PER_THREAD*BLOCK_DIM)
 
-    T sum = T(0);
-    if (threadIdx.x == blockDim.x - 1)
+template <typename T>
+__device__ T BlockScanBlelloch(T *s_block)
+{
+    // phase I: thread local sequential scan
     {
-        sum = block[threadIdx.x];
-        block[threadIdx.x] = T(0);
+        u32 thread_start = (threadIdx.x*2)*COARSE_FACTOR;
+        for (u32 i = 0; i < 2; ++i)
+        {
+            u32 start = thread_start + i*COARSE_FACTOR;
+            for (u32 j = 1; j < COARSE_FACTOR; ++j)
+            s_block[start + j] += s_block[start + (j-1)];
+        }
     }
     __syncthreads();
 
-    for (int stride = blockDim.x/2; stride >= 1; stride /= 2)
+    // phase II.I: reduction tree
+    for (int stride = 1; stride <= BLOCK_DIM; stride *= 2)
     {
         int index = (threadIdx.x + 1)*2*stride - 1;
-        if (index < blockDim.x)
+        if (index < 2*BLOCK_DIM)
         {
-            T l = block[index - stride];
-            T r = block[index];
-            block[index] = l + r;
-            block[index - stride] = r; 
+            int left = (index - stride)*COARSE_FACTOR + (COARSE_FACTOR - 1);
+            int right = index*COARSE_FACTOR + (COARSE_FACTOR - 1);
+            s_block[right] += s_block[left];
         }
         __syncthreads();
     }
 
-    T value_to_store = sum;
-    if (threadIdx.x != blockDim.x - 1)
-        value_to_store = block[threadIdx.x + 1];
+    // prepare for downsweep, save block sum for exclusive -> inclusive conversion
+    T sum = T(0);
+    if (threadIdx.x == (blockDim.x - 1))
+    {
+        u32 index = threadIdx.x*2*COARSE_FACTOR + (2*COARSE_FACTOR - 1);
+        sum = s_block[index];
+        s_block[index] = T(0);
+    }
+    __syncthreads();
+    
+    // phase II.II: downsweep
+    for (u32 stride = BLOCK_DIM; stride >= 1; stride /= 2)
+    {
+        u32 index = (threadIdx.x + 1)*2*stride - 1;
+        if (index < 2*BLOCK_DIM)
+        {
+            u32 left = (index - stride)*COARSE_FACTOR + (COARSE_FACTOR - 1);
+            u32 right = index*COARSE_FACTOR + (COARSE_FACTOR - 1);
+            
+            T temp = s_block[left];
+            s_block[left] = s_block[right];
+            s_block[right] += temp;
+        }
+        __syncthreads();
+    }
+    
+    // exclusive -> inclusive
+    {
+        u32 thread_start = (threadIdx.x*2)*COARSE_FACTOR;
+
+        T inclusive_result[2];
+        for (u32 i = 0; i < 2; ++i)
+        {
+            u32 index = thread_start + (i + 1)*COARSE_FACTOR + (COARSE_FACTOR - 1);
+            if (index < ELEMENTS_PER_BLOCK)
+                inclusive_result[i] = s_block[index];
+            else
+                inclusive_result[i] = sum;
+        }
+        __syncthreads();
+
+        for (u32 i = 0; i < 2; ++i)
+            s_block[thread_start + i*COARSE_FACTOR + (COARSE_FACTOR - 1)] = inclusive_result[i];
+        __syncthreads();
+    }
+
+    // phase III: distribute the previous sums
+    {
+        u32 thread_start = (threadIdx.x*2)*COARSE_FACTOR;
+        for (u32 i = 0; i < 2; ++i)
+        {
+            int prev_index = (int)thread_start + (i-1)*COARSE_FACTOR + (COARSE_FACTOR - 1);
+            if (prev_index > 0)
+            {
+                T prev_sum = s_block[prev_index];
+                for (int j = 0; j < COARSE_FACTOR - 1; ++j)
+                    s_block[thread_start + i*COARSE_FACTOR + j] += prev_sum;
+            }
+        }
+    }
     __syncthreads();
 
-    block[threadIdx.x] = value_to_store;
-
-    return block[threadIdx.x];
+    return sum;
 }
 
 template <typename T>
 __global__ void InclusiveScanUpsweep(u64 count, T *array, T *summary)
 {
-    __shared__ T segment[SEGMENT_SIZE];
+    __shared__ T segment[ELEMENTS_PER_BLOCK];
 
-    int index = blockIdx.x*blockDim.x + threadIdx.x;
-    if (index < count)
-        segment[threadIdx.x] = array[index];
-    else
-        segment[threadIdx.x] = T(0);
+    for (int i = 0; i < ELEMENTS_PER_THREAD; ++i)
+    {
+        int smem_index = i*blockDim.x + threadIdx.x;
+        int gmem_index = blockIdx.x*ELEMENTS_PER_BLOCK + smem_index;
+        if (gmem_index < count)
+            segment[smem_index] = array[gmem_index];
+        else
+            segment[smem_index] = T(0);
+    }
     __syncthreads();
 
     // T scan_result = BlockScan1(segment);
     // T scan_result = BlockScan2(segment);
-    T scan_result = BlockScan3(segment);
+    BlockScanBlelloch(segment);
 
-    if (index < count)
-        array[index] = scan_result;
+    for (int i = 0; i < ELEMENTS_PER_THREAD; ++i)
+    {
+        int smem_index = i*blockDim.x + threadIdx.x;
+        int gmem_index = blockIdx.x*ELEMENTS_PER_BLOCK + smem_index;
+        if (gmem_index < count)
+            array[gmem_index] = segment[smem_index];
+    }
 
     if (summary && (threadIdx.x == blockDim.x - 1))
-        summary[blockIdx.x] = scan_result;
+        summary[blockIdx.x] = segment[threadIdx.x*ELEMENTS_PER_THREAD + (ELEMENTS_PER_THREAD - 1)];
 }
 
 template <typename T>
@@ -139,30 +202,51 @@ __global__ void InclusiveScanDownsweep(u64 count, T *array, T *summary)
         int prev_block_index = blockIdx.x - 1;
         T prev_block_sum = summary[prev_block_index];
         
-        int index = blockIdx.x*blockDim.x + threadIdx.x;
-        if (index < count)
-            array[index] = array[index] + prev_block_sum;
+        for (int i = 0; i < ELEMENTS_PER_THREAD; ++i)
+        {
+            int index = blockIdx.x*ELEMENTS_PER_BLOCK + i*blockDim.x + threadIdx.x;
+            if (index < count)
+                array[index] += prev_block_sum;
+        }
     }
 }
 
 template <typename T>
 __global__ void ExclusiveScanUpsweep(u64 count, T *array, T *summary)
 {
-    __shared__ T segment[SEGMENT_SIZE];
+    __shared__ T segment[ELEMENTS_PER_BLOCK];
 
-    int index = blockIdx.x*blockDim.x + threadIdx.x;
-    if (index < count && threadIdx.x != 0)
-        segment[threadIdx.x] = array[index - 1];
-    else
-        segment[threadIdx.x] = T(0);
+    for (int i = 0; i < ELEMENTS_PER_THREAD; ++i)
+    {
+        int smem_index = i*blockDim.x + threadIdx.x;
+        int gmem_index = blockIdx.x*ELEMENTS_PER_BLOCK + smem_index;
 
-    T scan_result = BlockScan1(segment);
+        if ((gmem_index >= count) || ((threadIdx.x == 0) && (i == 0)))
+            segment[smem_index] = T(0);
+        else
+            segment[smem_index] = array[gmem_index - 1];
+    }
+    __syncthreads();
+
+    // T scan_result = BlockScan1(segment);
+    // T scan_result = BlockScan2(segment);
+    T block_sum = BlockScanBlelloch(segment);
 
     if (summary && (threadIdx.x == blockDim.x - 1))
-        summary[blockIdx.x] = scan_result + array[index];
+    {
+        u64 index = blockIdx.x*ELEMENTS_PER_BLOCK + threadIdx.x*ELEMENTS_PER_THREAD + (ELEMENTS_PER_THREAD - 1);
+        if (index > count - 1)
+            index = count - 1;
+        summary[blockIdx.x] = block_sum + array[index];
+    }
 
-    if (index < count)
-        array[index] = scan_result;
+    for (int i = 0; i < ELEMENTS_PER_THREAD; ++i)
+    {
+        int smem_index = i*blockDim.x + threadIdx.x;
+        int gmem_index = blockIdx.x*ELEMENTS_PER_BLOCK + smem_index;
+        if (gmem_index < count)
+            array[gmem_index] = segment[smem_index];
+    }
 }
 
 template <typename T>
@@ -170,12 +254,13 @@ __global__ void ExclusiveScanDownsweep(u64 count, T *array, T *summary)
 {
     if (blockIdx.x > 0)
     {
-        int block_index = blockIdx.x;
-        T block_sum = summary[block_index];
-        
-        int index = blockIdx.x*blockDim.x + threadIdx.x;
-        if (index < count)
-            array[index] = array[index] + block_sum;
+        T block_sum = summary[blockIdx.x];
+        for (int i = 0; i < ELEMENTS_PER_THREAD; ++i)
+        {
+            int index = blockIdx.x*ELEMENTS_PER_BLOCK + i*blockDim.x + threadIdx.x;
+            if (index < count)
+                array[index] += block_sum;
+        }
     }
 }
 
@@ -196,7 +281,7 @@ struct Scan_Input
 };
 
 template <typename T>
-static Scan_Input<T> *Scan_CreateInput(Arena *arena, u64 count, T *d_array, int block_dim)
+static Scan_Input<T> *Scan_CreateInput(Arena *arena, u64 count, T *d_array)
 {
     Scan_Input<T> *input = PushStruct(arena, Scan_Input<T>);
 
@@ -205,20 +290,20 @@ static Scan_Input<T> *Scan_CreateInput(Arena *arena, u64 count, T *d_array, int 
         u64 size = 0ull;
 
         // Add the number of elements for the first pass..
-        u64 out_count = (count + block_dim - 1)/block_dim;
+        u64 out_count = (count + ELEMENTS_PER_BLOCK - 1)/ELEMENTS_PER_BLOCK;
         size += out_count*sizeof(*input->d_scratch);
 
         // Add the number of elements for the second pass.. and we are done because we can just ping-pong.
-        out_count = (out_count + block_dim - 1)/block_dim;
+        out_count = (out_count + ELEMENTS_PER_BLOCK - 1)/ELEMENTS_PER_BLOCK;
         size += out_count*sizeof(*input->d_scratch);
 
         CUDACheck(cudaMalloc(&input->d_scratch, size));
     }
 
-    input->pass_input_count = (u32)ceilf(logf(count)/logf(block_dim));
+    input->pass_input_count = (u32)ceilf(logf(count)/logf(ELEMENTS_PER_BLOCK));
     input->pass_inputs = PushArrayZero(arena, Scan_PassInput<T>, input->pass_input_count);
 
-    int out_count = (count + block_dim - 1)/block_dim; // output of the first pass
+    int out_count = (count + ELEMENTS_PER_BLOCK - 1)/ELEMENTS_PER_BLOCK; // output of the first pass
     T *d_pingpong[] = {input->d_scratch, input->d_scratch + out_count};
     u64 element_count = count;
 
@@ -229,7 +314,7 @@ static Scan_Input<T> *Scan_CreateInput(Arena *arena, u64 count, T *d_array, int 
         pass_input->d_summary = d_pingpong[i % 2];
         pass_input->element_count = element_count;
 
-        int grid_dim = (element_count + block_dim - 1)/block_dim;
+        int grid_dim = (element_count + ELEMENTS_PER_BLOCK - 1)/ELEMENTS_PER_BLOCK;
         
         d_array = pass_input->d_summary;
         element_count = grid_dim;
@@ -249,42 +334,40 @@ static void Scan_DestroyInput(Scan_Input<T> *input)
 template <typename T>
 static void InclusiveScan1(Scan_Input<T> *input, cudaStream_t stream)
 {
-    int block_dim = SEGMENT_SIZE;
     u32 k = input->pass_input_count;
 
     for (u32 pass = 0; pass < k; ++pass) // k upsweeps
     {
         Scan_PassInput<T> *pass_input = input->pass_inputs + pass;
-        int grid_dim = (pass_input->element_count + block_dim - 1)/block_dim;
-        CUDACheck((InclusiveScanUpsweep<T><<<grid_dim, block_dim, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
+        int grid_dim = (pass_input->element_count + ELEMENTS_PER_BLOCK - 1)/ELEMENTS_PER_BLOCK;
+        CUDACheck((InclusiveScanUpsweep<T><<<grid_dim, BLOCK_DIM, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
     }
 
     for (s32 pass = k - 2; pass >= 0; --pass) // k - 1 downsweeps
     {
         Scan_PassInput<T> *pass_input = input->pass_inputs + pass;
-        int grid_dim = (pass_input->element_count + block_dim - 1)/block_dim;
-        CUDACheck((InclusiveScanDownsweep<T><<<grid_dim, block_dim, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
+        int grid_dim = (pass_input->element_count + ELEMENTS_PER_BLOCK - 1)/ELEMENTS_PER_BLOCK;
+        CUDACheck((InclusiveScanDownsweep<T><<<grid_dim, BLOCK_DIM, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
     }
 }
 
 template <typename T>
 static void ExclusiveScan1(Scan_Input<T> *input, cudaStream_t stream)
 {
-    int block_dim = SEGMENT_SIZE;
     u32 k = input->pass_input_count;
 
     for (u32 pass = 0; pass < k; ++pass) // k upsweeps
     {
         Scan_PassInput<T> *pass_input = input->pass_inputs + pass;
-        int grid_dim = (pass_input->element_count + block_dim - 1)/block_dim;
-        CUDACheck((ExclusiveScanUpsweep<T><<<grid_dim, block_dim, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
+        int grid_dim = (pass_input->element_count + ELEMENTS_PER_BLOCK - 1)/ELEMENTS_PER_BLOCK;
+        CUDACheck((ExclusiveScanUpsweep<T><<<grid_dim, BLOCK_DIM, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
     }
 
     for (s32 pass = k - 2; pass >= 0; --pass) // k - 1 downsweeps
     {
         Scan_PassInput<T> *pass_input = input->pass_inputs + pass;
-        int grid_dim = (pass_input->element_count + block_dim - 1)/block_dim;
-        CUDACheck((ExclusiveScanDownsweep<T><<<grid_dim, block_dim, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
+        int grid_dim = (pass_input->element_count + ELEMENTS_PER_BLOCK - 1)/ELEMENTS_PER_BLOCK;
+        CUDACheck((ExclusiveScanDownsweep<T><<<grid_dim, BLOCK_DIM, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
     }
 }
 
@@ -330,7 +413,7 @@ static Data<T> *CreateData(Arena *arena, u64 count, cudaStream_t stream)
 
     CUDACheck(cudaStreamSynchronize(stream));
 
-    data->input = Scan_CreateInput(arena, data->count, data->d_array, SEGMENT_SIZE);
+    data->input = Scan_CreateInput(arena, data->count, data->d_array);
 
     return data;
 }
@@ -375,15 +458,15 @@ int main(int argc, char **argv)
         file_name = argv[1];
     }
 
+    f64 peak_gbps = 0.0;
+    f64 peak_gflops = 0.0;
+    GetPeakMeasurements(&peak_gbps, &peak_gflops, true);
+
     if (1)
     {
         TestScan();
         printf("All tests passed\n");
     }
-
-    f64 peak_gbps = 0.0;
-    f64 peak_gflops = 0.0;
-    GetPeakMeasurements(&peak_gbps, &peak_gflops, true);
     
     printf("Bandwidth (Peak):\t%.2f GBPS\n", peak_gbps);
     printf("Throughput (Peak):\t%.2f GFLOPS\n", peak_gflops);
@@ -410,7 +493,7 @@ static void TestScan()
             Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
             
             Data<int> *data = CreateData<int>(scratch.arena, count, 0);
-            Scan_Input<int> *input = Scan_CreateInput(scratch.arena, count, data->d_array, SEGMENT_SIZE);
+            Scan_Input<int> *input = Scan_CreateInput(scratch.arena, count, data->d_array);
             InclusiveScan1<int>(input, 0);
             
             int *gpu_output = PushArray(scratch.arena, int, count);
@@ -421,6 +504,14 @@ static void TestScan()
             {
                 if (data->h_array[i] != gpu_output[i])
                 {
+                    if (1)
+                    {
+                        for (int _i = 0; _i < 100; _i++)
+                        {
+                            printf("%d, ", gpu_output[_i]);
+                        }
+                        printf("\t...\t%d\n", gpu_output[count - 1]);
+                    }
                     printf("[FAIL] Result[%d] (GPU): %d \tExpected: %d\n", i, gpu_output[i], data->h_array[i]);
                     exit(1);
                 }
@@ -438,7 +529,7 @@ static void TestScan()
             Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
 
             Data<int> *data = CreateData<int>(scratch.arena, count, 0);
-            Scan_Input<int> *input = Scan_CreateInput(scratch.arena, count, data->d_array, SEGMENT_SIZE);
+            Scan_Input<int> *input = Scan_CreateInput(scratch.arena, count, data->d_array);
             ExclusiveScan1<int>(input, 0);
             
             int *gpu_output = PushArray(scratch.arena, int, count);

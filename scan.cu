@@ -47,25 +47,56 @@ __device__ T BlockScan1(T *block)
 #define ELEMENTS_PER_BLOCK ((2*COARSE_FACTOR)*BLOCK_DIM)
 
 template <typename T>
-__device__ T BlockScan2(T *block)
+__device__ T BlockScanBrentKung(T *s_block)
 {
-    for (int stride = 1; stride < blockDim.x; stride *= 2)
+    // phase I: thread local sequential scan
     {
-        int index = 2*stride*(threadIdx.x + 1) - 1;
-        if (index < blockDim.x)
-            block[index] += block[index - stride];
+        u32 thread_start = (threadIdx.x*2)*COARSE_FACTOR;
+        for (u32 i = 0; i < 2; ++i)
+        {
+            u32 start = thread_start + i*COARSE_FACTOR;
+            for (u32 j = 1; j < COARSE_FACTOR; ++j)
+                s_block[start + j] += s_block[start + (j-1)];
+        }
+    }
+    __syncthreads();
+
+    // phase II.I: reduction tree
+    for (int stride = 1*COARSE_FACTOR; stride <= BLOCK_DIM*COARSE_FACTOR; stride *= 2)
+    {
+        int index = (threadIdx.x + 1)*2*stride - 1;
+        if (index < 2*BLOCK_DIM*COARSE_FACTOR)
+            s_block[index] += s_block[index - stride];
         __syncthreads();
     }
 
-    for (int stride = blockDim.x/4; stride >= 1; stride /= 2)
+    // phase II.II: downward
+    for (int stride = ((2*BLOCK_DIM)/4)*COARSE_FACTOR; stride >= 1*COARSE_FACTOR; stride /= 2)
     {
-        int index = 2*stride*(threadIdx.x + 1) - 1;
-        if (index + stride < blockDim.x)
-            block[index + stride] += block[index];
+        int index = (threadIdx.x + 1)*2*stride - 1;
+        if (index + stride < 2*BLOCK_DIM*COARSE_FACTOR)
+            s_block[index + stride] += s_block[index];
         __syncthreads();
     }
 
-    return block[threadIdx.x];
+    // phase III: distribute the previous sums
+    {
+        u32 thread_start = (threadIdx.x*2)*COARSE_FACTOR;
+        for (u32 i = 0; i < 2; ++i)
+        {
+            int prev_index = (int)thread_start + (i-1)*COARSE_FACTOR + (COARSE_FACTOR - 1);
+            if (prev_index > 0)
+            {
+                T prev_sum = s_block[prev_index];
+                for (int j = 0; j < COARSE_FACTOR - 1; ++j)
+                    s_block[thread_start + i*COARSE_FACTOR + j] += prev_sum;
+            }
+        }
+    }
+    __syncthreads();
+
+    T sum = s_block[(blockDim.x - 1)*2*COARSE_FACTOR + (2*COARSE_FACTOR - 1)];
+    return sum;
 }
 
 template <typename T>
@@ -171,7 +202,7 @@ __global__ void InclusiveScanUpsweep(u64 count, T *array, T *summary)
     __syncthreads();
 
     // T scan_result = BlockScan1(segment);
-    // T scan_result = BlockScan2(segment);
+    // BlockScanBrentKung(segment);
     BlockScanBlelloch(segment);
 
     for (int i = 0; i < 2*COARSE_FACTOR; ++i)
@@ -224,7 +255,7 @@ __global__ void ExclusiveScanUpsweep(u64 count, T *array, T *summary)
     __syncthreads();
 
     // T scan_result = BlockScan1(segment);
-    // T scan_result = BlockScan2(segment);
+    // T block_sum = BlockScanBrentKung(segment);
     T block_sum = BlockScanBlelloch(segment);
 
     if (summary && (threadIdx.x == blockDim.x - 1))

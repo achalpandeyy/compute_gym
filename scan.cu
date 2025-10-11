@@ -42,6 +42,10 @@ __device__ T BlockScan1(T *block)
     return block[threadIdx.x];
 }
 
+#define BLOCK_DIM 512
+#define COARSE_FACTOR 8
+#define ELEMENTS_PER_BLOCK ((2*COARSE_FACTOR)*BLOCK_DIM)
+
 template <typename T>
 __device__ T BlockScan2(T *block)
 {
@@ -64,10 +68,6 @@ __device__ T BlockScan2(T *block)
     return block[threadIdx.x];
 }
 
-#define BLOCK_DIM 512
-#define COARSE_FACTOR 8
-#define ELEMENTS_PER_BLOCK ((2*COARSE_FACTOR)*BLOCK_DIM)
-
 template <typename T>
 __device__ T BlockScanBlelloch(T *s_block)
 {
@@ -78,21 +78,17 @@ __device__ T BlockScanBlelloch(T *s_block)
         {
             u32 start = thread_start + i*COARSE_FACTOR;
             for (u32 j = 1; j < COARSE_FACTOR; ++j)
-            s_block[start + j] += s_block[start + (j-1)];
+                s_block[start + j] += s_block[start + (j-1)];
         }
     }
     __syncthreads();
 
     // phase II.I: reduction tree
-    for (int stride = 1; stride <= BLOCK_DIM; stride *= 2)
+    for (int stride = 1*COARSE_FACTOR; stride <= BLOCK_DIM*COARSE_FACTOR; stride *= 2)
     {
         int index = (threadIdx.x + 1)*2*stride - 1;
-        if (index < 2*BLOCK_DIM)
-        {
-            int left = (index - stride)*COARSE_FACTOR + (COARSE_FACTOR - 1);
-            int right = index*COARSE_FACTOR + (COARSE_FACTOR - 1);
-            s_block[right] += s_block[left];
-        }
+        if (index < 2*BLOCK_DIM*COARSE_FACTOR)
+            s_block[index] += s_block[index - stride];
         __syncthreads();
     }
 
@@ -107,17 +103,14 @@ __device__ T BlockScanBlelloch(T *s_block)
     __syncthreads();
     
     // phase II.II: downsweep
-    for (u32 stride = BLOCK_DIM; stride >= 1; stride /= 2)
+    for (u32 stride = BLOCK_DIM*COARSE_FACTOR; stride >= 1*COARSE_FACTOR; stride /= 2)
     {
         u32 index = (threadIdx.x + 1)*2*stride - 1;
-        if (index < 2*BLOCK_DIM)
+        if (index < 2*BLOCK_DIM*COARSE_FACTOR)
         {
-            u32 left = (index - stride)*COARSE_FACTOR + (COARSE_FACTOR - 1);
-            u32 right = index*COARSE_FACTOR + (COARSE_FACTOR - 1);
-            
-            T temp = s_block[left];
-            s_block[left] = s_block[right];
-            s_block[right] += temp;
+            T temp = s_block[index - stride];
+            s_block[index - stride] = s_block[index];
+            s_block[index] += temp;
         }
         __syncthreads();
     }

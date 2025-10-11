@@ -66,8 +66,7 @@ __device__ T BlockScan2(T *block)
 
 #define BLOCK_DIM 512
 #define COARSE_FACTOR 8
-#define ELEMENTS_PER_THREAD (2*COARSE_FACTOR)
-#define ELEMENTS_PER_BLOCK (ELEMENTS_PER_THREAD*BLOCK_DIM)
+#define ELEMENTS_PER_BLOCK ((2*COARSE_FACTOR)*BLOCK_DIM)
 
 template <typename T>
 __device__ T BlockScanBlelloch(T *s_block)
@@ -167,7 +166,7 @@ __global__ void InclusiveScanUpsweep(u64 count, T *array, T *summary)
 {
     __shared__ T segment[ELEMENTS_PER_BLOCK];
 
-    for (int i = 0; i < ELEMENTS_PER_THREAD; ++i)
+    for (int i = 0; i < 2*COARSE_FACTOR; ++i)
     {
         int smem_index = i*blockDim.x + threadIdx.x;
         int gmem_index = blockIdx.x*ELEMENTS_PER_BLOCK + smem_index;
@@ -182,7 +181,7 @@ __global__ void InclusiveScanUpsweep(u64 count, T *array, T *summary)
     // T scan_result = BlockScan2(segment);
     BlockScanBlelloch(segment);
 
-    for (int i = 0; i < ELEMENTS_PER_THREAD; ++i)
+    for (int i = 0; i < 2*COARSE_FACTOR; ++i)
     {
         int smem_index = i*blockDim.x + threadIdx.x;
         int gmem_index = blockIdx.x*ELEMENTS_PER_BLOCK + smem_index;
@@ -191,7 +190,10 @@ __global__ void InclusiveScanUpsweep(u64 count, T *array, T *summary)
     }
 
     if (summary && (threadIdx.x == blockDim.x - 1))
-        summary[blockIdx.x] = segment[threadIdx.x*ELEMENTS_PER_THREAD + (ELEMENTS_PER_THREAD - 1)];
+    {
+        u32 index = threadIdx.x*2*COARSE_FACTOR + (2*COARSE_FACTOR - 1);
+        summary[blockIdx.x] = segment[index];
+    }
 }
 
 template <typename T>
@@ -202,7 +204,7 @@ __global__ void InclusiveScanDownsweep(u64 count, T *array, T *summary)
         int prev_block_index = blockIdx.x - 1;
         T prev_block_sum = summary[prev_block_index];
         
-        for (int i = 0; i < ELEMENTS_PER_THREAD; ++i)
+        for (int i = 0; i < 2*COARSE_FACTOR; ++i)
         {
             int index = blockIdx.x*ELEMENTS_PER_BLOCK + i*blockDim.x + threadIdx.x;
             if (index < count)
@@ -216,7 +218,7 @@ __global__ void ExclusiveScanUpsweep(u64 count, T *array, T *summary)
 {
     __shared__ T segment[ELEMENTS_PER_BLOCK];
 
-    for (int i = 0; i < ELEMENTS_PER_THREAD; ++i)
+    for (int i = 0; i < 2*COARSE_FACTOR; ++i)
     {
         int smem_index = i*blockDim.x + threadIdx.x;
         int gmem_index = blockIdx.x*ELEMENTS_PER_BLOCK + smem_index;
@@ -234,13 +236,13 @@ __global__ void ExclusiveScanUpsweep(u64 count, T *array, T *summary)
 
     if (summary && (threadIdx.x == blockDim.x - 1))
     {
-        u64 index = blockIdx.x*ELEMENTS_PER_BLOCK + threadIdx.x*ELEMENTS_PER_THREAD + (ELEMENTS_PER_THREAD - 1);
+        u64 index = blockIdx.x*ELEMENTS_PER_BLOCK + threadIdx.x*2*COARSE_FACTOR + (2*COARSE_FACTOR - 1);
         if (index > count - 1)
             index = count - 1;
         summary[blockIdx.x] = block_sum + array[index];
     }
 
-    for (int i = 0; i < ELEMENTS_PER_THREAD; ++i)
+    for (int i = 0; i < 2*COARSE_FACTOR; ++i)
     {
         int smem_index = i*blockDim.x + threadIdx.x;
         int gmem_index = blockIdx.x*ELEMENTS_PER_BLOCK + smem_index;
@@ -255,7 +257,7 @@ __global__ void ExclusiveScanDownsweep(u64 count, T *array, T *summary)
     if (blockIdx.x > 0)
     {
         T block_sum = summary[blockIdx.x];
-        for (int i = 0; i < ELEMENTS_PER_THREAD; ++i)
+        for (int i = 0; i < 2*COARSE_FACTOR; ++i)
         {
             int index = blockIdx.x*ELEMENTS_PER_BLOCK + i*blockDim.x + threadIdx.x;
             if (index < count)

@@ -111,10 +111,21 @@ __device__ T SegmentScan_WE(u64 count, T *array)
     {
         int smem_index = i*block_dim + threadIdx.x;
         int gmem_index = blockIdx.x*2*coarse_factor*block_dim + smem_index;
-        if (gmem_index < count)
+
+        if constexpr (inclusive)
+        {
+            if (gmem_index < count)
                 segment[smem_index] = array[gmem_index];
             else
                 segment[smem_index] = T(0);
+        }
+        else
+        {
+            if ((gmem_index >= count) || ((threadIdx.x == 0) && (i == 0)))
+                segment[smem_index] = T(0);
+            else
+                segment[smem_index] = array[gmem_index - 1];
+        }
     }
     __syncthreads();
 
@@ -140,74 +151,38 @@ __device__ T SegmentScan_WE(u64 count, T *array)
     }
 
     T segment_result = segment[(block_dim - 1)*2*coarse_factor + (2*coarse_factor - 1)];
-
-    if constexpr (inclusive)
+    if constexpr (!inclusive)
     {
-        // step II.II: downward
-        for (int stride = ((2*block_dim)/4)*coarse_factor; stride >= 1*coarse_factor; stride /= 2)
-        {
-            int index = (threadIdx.x + 1)*2*stride - 1;
-            if (index + stride < 2*block_dim*coarse_factor)
-                segment[index + stride] += segment[index];
-            __syncthreads();
-        }
+        u64 index = blockIdx.x*2*coarse_factor*block_dim + (block_dim - 1)*2*coarse_factor + (2*coarse_factor - 1);
+        if (index > count - 1)
+            index = count - 1;
+        segment_result += array[index];
+    }
 
-        // step III: fixup
-        {
-            u32 thread_start = (threadIdx.x*2)*coarse_factor;
-            for (u32 i = 0; i < 2; ++i)
-            {
-                u32 start = thread_start + i*coarse_factor;
-                if (start > 0)
-                {
-                    T prev = segment[start - 1];
-                    for (u32 j = 0; j < coarse_factor - 1; ++j)
-                        segment[start + j] += prev;
-                }
-            }
-        }
+    // step II.II: downward
+    for (int stride = ((2*block_dim)/4)*coarse_factor; stride >= 1*coarse_factor; stride /= 2)
+    {
+        int index = (threadIdx.x + 1)*2*stride - 1;
+        if (index + stride < 2*block_dim*coarse_factor)
+            segment[index + stride] += segment[index];
         __syncthreads();
     }
-    else
+
+    // step III: fixup
     {
-        if (threadIdx.x == (block_dim - 1))
+        u32 thread_start = (threadIdx.x*2)*coarse_factor;
+        for (u32 i = 0; i < 2; ++i)
         {
-            u32 index = threadIdx.x*2*coarse_factor + (2*coarse_factor - 1);
-            segment[index] = T(0);
-        }
-        __syncthreads();
-
-        // step II.II: downsweep
-        for (u32 stride = block_dim*coarse_factor; stride >= 1*coarse_factor; stride /= 2)
-        {
-            u32 index = (threadIdx.x + 1)*2*stride - 1;
-            if (index < 2*block_dim*coarse_factor)
+            u32 start = thread_start + i*coarse_factor;
+            if (start > 0)
             {
-                T temp = segment[index - stride];
-                segment[index - stride] = segment[index];
-                segment[index] += temp;
-            }
-            __syncthreads();
-        }
-
-        // step III: fixup
-        {
-            u32 thread_start = (threadIdx.x*2)*coarse_factor;
-            for (u32 i = 0; i < 2; ++i)
-            {
-                u32 start = thread_start + i*coarse_factor;
-                T last = segment[start + (coarse_factor - 1)];
-                for (s32 j = coarse_factor - 1; j >= 0; --j)
-                {
-                    T prev = 0;
-                    if (j > 0)
-                        prev = segment[start + (j - 1)];
-                    segment[start + j] = prev + last;
-                }
+                T prev = segment[start - 1];
+                for (u32 j = 0; j < coarse_factor - 1; ++j)
+                    segment[start + j] += prev;
             }
         }
-        __syncthreads();
     }
+    __syncthreads();
 
     for (int i = 0; i < 2*coarse_factor; ++i)
     {
@@ -429,7 +404,8 @@ static b32 ValidateGPUOutput(Arena *arena, Data<T> *data)
     T *gpu_out = PushArray(scratch.arena, T, data->count);
     CUDACheck(cudaMemcpy(gpu_out, data->d_array, data->count*sizeof(*gpu_out), cudaMemcpyDeviceToHost));
 
-    SequentialInclusiveScan<T>(data->count, data->h_array);
+    // SequentialInclusiveScan<T>(data->count, data->h_array);
+    SequentialExclusiveScan<T>(data->count, data->h_array);
     b32 result = (memcmp(gpu_out, data->h_array, data->count*sizeof(*gpu_out)) == 0);
 
     ScratchEnd(&scratch);
@@ -440,7 +416,7 @@ static b32 ValidateGPUOutput(Arena *arena, Data<T> *data)
 template <typename T>
 static void FunctionToBenchmark(Data<T> *data, cudaStream_t stream)
 {
-    Scan<T, true, g_block_dim, g_coarse_factor>(data->input, stream);
+    Scan<T, false, g_block_dim, g_coarse_factor>(data->input, stream);
     // ThrustInclusiveScan<T>(data->count, data->d_array, data->d_array, stream);
 }
 

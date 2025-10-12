@@ -24,323 +24,235 @@ static void SequentialExclusiveScan(int count, T *array)
     }
 }
 
-#define BLOCK_DIM 512
-#define COARSE_FACTOR 8
-
-template <typename T>
-__device__ T BlockScan1(T *s_block)
+template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
+__device__ T SegmentScan_KoggeStone(u64 count, T *array)
 {
+    __shared__ T segment[coarse_factor*block_dim];
+
+    for (int i = 0; i < coarse_factor; ++i)
+    {
+        int smem_index = i*block_dim + threadIdx.x;
+        int gmem_index = blockIdx.x*coarse_factor*block_dim + smem_index;
+        if constexpr (inclusive)
+        {
+            if (gmem_index < count)
+                segment[smem_index] = array[gmem_index];
+            else
+                segment[smem_index] = T(0);
+        }
+        else
+        {
+            if ((gmem_index >= count) || ((threadIdx.x == 0) && (i == 0)))
+                segment[smem_index] = T(0);
+            else
+                segment[smem_index] = array[gmem_index - 1];
+        }
+    }
+    __syncthreads();
+
     // step I: thread local sequential scan
     {
-        u32 start = threadIdx.x*COARSE_FACTOR;
-        for (u32 j = 1; j < COARSE_FACTOR; ++j)
-            s_block[start + j] += s_block[start + (j-1)];
+        u32 start = threadIdx.x*coarse_factor;
+        for (u32 j = 1; j < coarse_factor; ++j)
+            segment[start + j] += segment[start + (j - 1)];
     }
     __syncthreads();
 
     // step II: strided scan
-    for (int stride = 1; stride < blockDim.x; stride *= 2)
+    for (int stride = 1; stride < block_dim; stride *= 2)
     {
         T temp = T(0);
         if (threadIdx.x >= stride)
-            temp = s_block[(threadIdx.x - stride)*COARSE_FACTOR + (COARSE_FACTOR - 1)];
+            temp = segment[(threadIdx.x - stride)*coarse_factor + (coarse_factor - 1)];
         __syncthreads();
 
-        s_block[threadIdx.x*COARSE_FACTOR + (COARSE_FACTOR - 1)] += temp;
+        segment[threadIdx.x*coarse_factor + (coarse_factor - 1)] += temp;
         __syncthreads();
     }
 
     // step III: fixup
     {
-        u32 start = threadIdx.x*COARSE_FACTOR;
+        u32 start = threadIdx.x*coarse_factor;
         if (start > 0)
         {
-            T prev = s_block[start - 1];
-            for (u32 j = 0; j < COARSE_FACTOR - 1; ++j)
-                s_block[start + j] += prev;
+            T prev = segment[start - 1];
+            for (u32 i = 0; i < coarse_factor - 1; ++i)
+                segment[start + i] += prev;
         }
     }
     __syncthreads();
 
-    T block_sum = s_block[(blockDim.x - 1)*COARSE_FACTOR + (COARSE_FACTOR - 1)];
-    return block_sum;
-}
-
-template <typename T>
-__global__ void InclusiveScanUpsweep(u64 count, T *array, T *summary)
-{
-    __shared__ T segment[COARSE_FACTOR*BLOCK_DIM];
-
-    for (int i = 0; i < COARSE_FACTOR; ++i)
+    T segment_result = segment[(block_dim - 1)*coarse_factor + (coarse_factor - 1)];
+    if constexpr (!inclusive)
     {
-        int smem_index = i*blockDim.x + threadIdx.x;
-        int gmem_index = blockIdx.x*COARSE_FACTOR*blockDim.x + smem_index;
-        if (gmem_index < count)
-            segment[smem_index] = array[gmem_index];
-        else
-            segment[smem_index] = T(0);
-    }
-    __syncthreads();
-
-    T block_sum = BlockScan1(segment);
-
-    for (int i = 0; i < COARSE_FACTOR; ++i)
-    {
-        int smem_index = i*blockDim.x + threadIdx.x;
-        int gmem_index = blockIdx.x*COARSE_FACTOR*blockDim.x + smem_index;
-        if (gmem_index < count)
-            array[gmem_index] = segment[smem_index];
-    }
-
-    if (summary && (threadIdx.x == blockDim.x - 1))
-    {
-        summary[blockIdx.x] = block_sum;
-    }
-}
-
-template <typename T>
-__global__ void InclusiveScanDownsweep(u64 count, T *array, T *summary)
-{
-    if (blockIdx.x > 0)
-    {
-        int prev_block_index = blockIdx.x - 1;
-        T prev_block_sum = summary[prev_block_index];
-        
-        for (int i = 0; i < COARSE_FACTOR; ++i)
-        {
-            int index = blockIdx.x*COARSE_FACTOR*BLOCK_DIM + i*blockDim.x + threadIdx.x;
-            if (index < count)
-                array[index] += prev_block_sum;
-        }
-    }
-}
-
-template <typename T>
-__global__ void ExclusiveScanUpsweep(u64 count, T *array, T *summary)
-{
-    __shared__ T segment[COARSE_FACTOR*BLOCK_DIM];
-
-    for (int i = 0; i < COARSE_FACTOR; ++i)
-    {
-        int smem_index = i*blockDim.x + threadIdx.x;
-        int gmem_index = blockIdx.x*COARSE_FACTOR*BLOCK_DIM + smem_index;
-
-        if ((gmem_index >= count) || ((threadIdx.x == 0) && (i == 0)))
-            segment[smem_index] = T(0);
-        else
-            segment[smem_index] = array[gmem_index - 1];
-    }
-    __syncthreads();
-
-    T block_sum = BlockScan1(segment);
-
-    if (summary && (threadIdx.x == blockDim.x - 1))
-    {
-        u64 index = blockIdx.x*COARSE_FACTOR*BLOCK_DIM + threadIdx.x*COARSE_FACTOR + (COARSE_FACTOR - 1);
+        u64 index = blockIdx.x*coarse_factor*block_dim + (block_dim - 1)*coarse_factor + (coarse_factor - 1);
         if (index > count - 1)
             index = count - 1;
-        summary[blockIdx.x] = block_sum + array[index];
+        segment_result += array[index];
     }
 
-    for (int i = 0; i < COARSE_FACTOR; ++i)
+    for (int i = 0; i < coarse_factor; ++i)
     {
-        int smem_index = i*blockDim.x + threadIdx.x;
-        int gmem_index = blockIdx.x*COARSE_FACTOR*BLOCK_DIM + smem_index;
+        int smem_index = i*block_dim + threadIdx.x;
+        int gmem_index = blockIdx.x*coarse_factor*block_dim + smem_index;
         if (gmem_index < count)
             array[gmem_index] = segment[smem_index];
     }
+
+    return segment_result;
 }
 
-template <typename T>
-__global__ void ExclusiveScanDownsweep(u64 count, T *array, T *summary)
+template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
+__device__ T SegmentScan_WE(u64 count, T *array)
 {
-    if (blockIdx.x > 0)
+    __shared__ T segment[2*coarse_factor*block_dim];
+
+    for (int i = 0; i < 2*coarse_factor; ++i)
     {
-        T block_sum = summary[blockIdx.x];
-        for (int i = 0; i < COARSE_FACTOR; ++i)
-        {
-            int index = blockIdx.x*COARSE_FACTOR*BLOCK_DIM + i*blockDim.x + threadIdx.x;
-            if (index < count)
-                array[index] += block_sum;
-        }
-    }
-}
-
-#define ELEMENTS_PER_BLOCK ((2*COARSE_FACTOR)*BLOCK_DIM)
-
-template <typename T>
-__device__ T BlockScan_BrentKung(T *s_block)
-{
-    // step I: thread local sequential scan
-    {
-        u32 thread_start = (threadIdx.x*2)*COARSE_FACTOR;
-        for (u32 i = 0; i < 2; ++i)
-        {
-            u32 start = thread_start + i*COARSE_FACTOR;
-            for (u32 j = 1; j < COARSE_FACTOR; ++j)
-                s_block[start + j] += s_block[start + (j-1)];
-        }
-    }
-    __syncthreads();
-
-    // step II.I: reduction tree
-    for (int stride = 1*COARSE_FACTOR; stride <= BLOCK_DIM*COARSE_FACTOR; stride *= 2)
-    {
-        int index = (threadIdx.x + 1)*2*stride - 1;
-        if (index < 2*BLOCK_DIM*COARSE_FACTOR)
-            s_block[index] += s_block[index - stride];
-        __syncthreads();
-    }
-
-    // step II.II: downward
-    for (int stride = ((2*BLOCK_DIM)/4)*COARSE_FACTOR; stride >= 1*COARSE_FACTOR; stride /= 2)
-    {
-        int index = (threadIdx.x + 1)*2*stride - 1;
-        if (index + stride < 2*BLOCK_DIM*COARSE_FACTOR)
-            s_block[index + stride] += s_block[index];
-        __syncthreads();
-    }
-
-    // step III: fixup
-    {
-        u32 thread_start = (threadIdx.x*2)*COARSE_FACTOR;
-        for (u32 i = 0; i < 2; ++i)
-        {
-            u32 start = thread_start + i*COARSE_FACTOR;
-            if (start > 0)
-            {
-                T prev = s_block[start - 1];
-                for (u32 j = 0; j < COARSE_FACTOR - 1; ++j)
-                    s_block[start + j] += prev;
-            }
-        }
-    }
-    __syncthreads();
-
-    T sum = s_block[(blockDim.x - 1)*2*COARSE_FACTOR + (2*COARSE_FACTOR - 1)];
-    return sum;
-}
-
-template <typename T>
-__device__ T BlockScan_Blelloch(T *s_block)
-{
-    // step I: thread local sequential scan
-    {
-        u32 thread_start = (threadIdx.x*2)*COARSE_FACTOR;
-        for (u32 i = 0; i < 2; ++i)
-        {
-            u32 start = thread_start + i*COARSE_FACTOR;
-            for (u32 j = 1; j < COARSE_FACTOR; ++j)
-                s_block[start + j] += s_block[start + (j-1)];
-        }
-    }
-    __syncthreads();
-
-    // step II.I: reduction tree
-    for (int stride = 1*COARSE_FACTOR; stride <= BLOCK_DIM*COARSE_FACTOR; stride *= 2)
-    {
-        int index = (threadIdx.x + 1)*2*stride - 1;
-        if (index < 2*BLOCK_DIM*COARSE_FACTOR)
-            s_block[index] += s_block[index - stride];
-        __syncthreads();
-    }
-
-    // prepare for downsweep
-    T block_sum = T(0);
-    if (threadIdx.x == (blockDim.x - 1))
-    {
-        u32 index = threadIdx.x*2*COARSE_FACTOR + (2*COARSE_FACTOR - 1);
-        block_sum = s_block[index];
-        s_block[index] = T(0);
-    }
-    __syncthreads();
-    
-    // step II.II: downsweep
-    for (u32 stride = BLOCK_DIM*COARSE_FACTOR; stride >= 1*COARSE_FACTOR; stride /= 2)
-    {
-        u32 index = (threadIdx.x + 1)*2*stride - 1;
-        if (index < 2*BLOCK_DIM*COARSE_FACTOR)
-        {
-            T temp = s_block[index - stride];
-            s_block[index - stride] = s_block[index];
-            s_block[index] += temp;
-        }
-        __syncthreads();
-    }
-
-    // step III: fixup
-    {
-        u32 thread_start = (threadIdx.x*2)*COARSE_FACTOR;
-        for (u32 i = 0; i < 2; ++i)
-        {
-            u32 start = thread_start + i*COARSE_FACTOR;
-            T last = s_block[start + (COARSE_FACTOR - 1)];
-            for (s32 j = COARSE_FACTOR - 1; j >= 0; --j)
-            {
-                T prev = 0;
-                if (j > 0)
-                    prev = s_block[start + (j - 1)];
-                s_block[start + j] = prev + last;
-            }
-        }
-    }
-    __syncthreads();
-
-    return block_sum;
-}
-
-template <typename T, b32 inclusive>
-__global__ void Scan_Upsweep(u64 count, T *array, T *summary)
-{
-    __shared__ T segment[ELEMENTS_PER_BLOCK];
-
-    for (int i = 0; i < 2*COARSE_FACTOR; ++i)
-    {
-        int smem_index = i*blockDim.x + threadIdx.x;
-        int gmem_index = blockIdx.x*ELEMENTS_PER_BLOCK + smem_index;
+        int smem_index = i*block_dim + threadIdx.x;
+        int gmem_index = blockIdx.x*2*coarse_factor*block_dim + smem_index;
         if (gmem_index < count)
-            segment[smem_index] = array[gmem_index];
-        else
-            segment[smem_index] = T(0);
+                segment[smem_index] = array[gmem_index];
+            else
+                segment[smem_index] = T(0);
     }
     __syncthreads();
 
-    T block_sum;
+    // step I: thread local sequential scan
+    {
+        u32 thread_start = (threadIdx.x*2)*coarse_factor;
+        for (u32 i = 0; i < 2; ++i)
+        {
+            u32 start = thread_start + i*coarse_factor;
+            for (u32 j = 1; j < coarse_factor; ++j)
+                segment[start + j] += segment[start + (j-1)];
+        }
+    }
+    __syncthreads();
+
+    // step II.I: reduction tree
+    for (int stride = 1*coarse_factor; stride <= block_dim*coarse_factor; stride *= 2)
+    {
+        int index = (threadIdx.x + 1)*2*stride - 1;
+        if (index < 2*block_dim*coarse_factor)
+            segment[index] += segment[index - stride];
+        __syncthreads();
+    }
+
+    T segment_result = segment[(block_dim - 1)*2*coarse_factor + (2*coarse_factor - 1)];
+
     if constexpr (inclusive)
-        block_sum = BlockScan_BrentKung(segment);
-    else
-        block_sum = BlockScan_Blelloch(segment);
-
-    if (summary && (threadIdx.x == blockDim.x - 1))
     {
-        summary[blockIdx.x] = block_sum;
+        // step II.II: downward
+        for (int stride = ((2*block_dim)/4)*coarse_factor; stride >= 1*coarse_factor; stride /= 2)
+        {
+            int index = (threadIdx.x + 1)*2*stride - 1;
+            if (index + stride < 2*block_dim*coarse_factor)
+                segment[index + stride] += segment[index];
+            __syncthreads();
+        }
+
+        // step III: fixup
+        {
+            u32 thread_start = (threadIdx.x*2)*coarse_factor;
+            for (u32 i = 0; i < 2; ++i)
+            {
+                u32 start = thread_start + i*coarse_factor;
+                if (start > 0)
+                {
+                    T prev = segment[start - 1];
+                    for (u32 j = 0; j < coarse_factor - 1; ++j)
+                        segment[start + j] += prev;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    else
+    {
+        if (threadIdx.x == (block_dim - 1))
+        {
+            u32 index = threadIdx.x*2*coarse_factor + (2*coarse_factor - 1);
+            segment[index] = T(0);
+        }
+        __syncthreads();
+
+        // step II.II: downsweep
+        for (u32 stride = block_dim*coarse_factor; stride >= 1*coarse_factor; stride /= 2)
+        {
+            u32 index = (threadIdx.x + 1)*2*stride - 1;
+            if (index < 2*block_dim*coarse_factor)
+            {
+                T temp = segment[index - stride];
+                segment[index - stride] = segment[index];
+                segment[index] += temp;
+            }
+            __syncthreads();
+        }
+
+        // step III: fixup
+        {
+            u32 thread_start = (threadIdx.x*2)*coarse_factor;
+            for (u32 i = 0; i < 2; ++i)
+            {
+                u32 start = thread_start + i*coarse_factor;
+                T last = segment[start + (coarse_factor - 1)];
+                for (s32 j = coarse_factor - 1; j >= 0; --j)
+                {
+                    T prev = 0;
+                    if (j > 0)
+                        prev = segment[start + (j - 1)];
+                    segment[start + j] = prev + last;
+                }
+            }
+        }
+        __syncthreads();
     }
 
-    for (int i = 0; i < 2*COARSE_FACTOR; ++i)
+    for (int i = 0; i < 2*coarse_factor; ++i)
     {
-        int smem_index = i*blockDim.x + threadIdx.x;
-        int gmem_index = blockIdx.x*ELEMENTS_PER_BLOCK + smem_index;
+        int smem_index = i*block_dim + threadIdx.x;
+        int gmem_index = blockIdx.x*2*coarse_factor*block_dim + smem_index;
         if (gmem_index < count)
             array[gmem_index] = segment[smem_index];
     }
+
+    return segment_result;
 }
 
-template <typename T, b32 inclusive>
-__global__ void Scan_Downsweep(u64 count, T *array, T *summary)
+template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
+__global__ void Scan_Upsweep(u64 count, T *array, T *summary, b32 work_efficient)
 {
+    T segment_result = T(0);
+    if (work_efficient)
+        segment_result = SegmentScan_WE<T, inclusive, block_dim, coarse_factor>(count, array);
+    else
+        segment_result = SegmentScan_KoggeStone<T, inclusive, block_dim, coarse_factor>(count, array);
+
+    if (summary && (threadIdx.x == block_dim - 1))
+        summary[blockIdx.x] = segment_result;
+}
+
+template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
+__global__ void Scan_Downsweep(u64 count, T *array, T *summary, b32 work_efficient)
+{
+    u64 elements_per_thread = coarse_factor;
+    if (work_efficient)
+        elements_per_thread *= 2;
+
     if (blockIdx.x > 0)
     {
-        T block_sum;
+        T segment_result;
         if constexpr (inclusive)
-            block_sum = summary[blockIdx.x - 1];
+            segment_result = summary[blockIdx.x - 1];
         else
-            block_sum = summary[blockIdx.x];
-        
-        for (int i = 0; i < 2*COARSE_FACTOR; ++i)
+            segment_result = summary[blockIdx.x];
+
+        for (int i = 0; i < elements_per_thread; ++i)
         {
-            int index = blockIdx.x*ELEMENTS_PER_BLOCK + i*blockDim.x + threadIdx.x;
+            int index = blockIdx.x*elements_per_thread*block_dim + i*block_dim + threadIdx.x;
             if (index < count)
-                array[index] += block_sum;
+                array[index] += segment_result;
         }
     }
 }
@@ -351,6 +263,7 @@ struct Scan_PassInput
     T *d_array;
     T *d_summary;
     u64 element_count;
+    b32 work_efficient;    
 };
 
 template <typename T>
@@ -361,12 +274,14 @@ struct Scan_Input
     Scan_PassInput<T> *pass_inputs;
 };
 
-template <typename T>
+b32 g_work_efficient = 1;
+
+template <typename T, u32 block_dim, u32 coarse_factor>
 static Scan_Input<T> *Scan_CreateInput(Arena *arena, u64 count, T *d_array)
 {
     Scan_Input<T> *input = PushStruct(arena, Scan_Input<T>);
 
-    u64 elements_per_block = COARSE_FACTOR*BLOCK_DIM;
+    u64 elements_per_block = g_work_efficient ? 2*coarse_factor*block_dim : coarse_factor*block_dim;
 
     // Allocate scratch
     {
@@ -396,6 +311,7 @@ static Scan_Input<T> *Scan_CreateInput(Arena *arena, u64 count, T *d_array)
         pass_input->d_array = d_array;
         pass_input->d_summary = d_pingpong[i % 2];
         pass_input->element_count = element_count;
+        pass_input->work_efficient = g_work_efficient;
 
         int grid_dim = (element_count + elements_per_block - 1)/elements_per_block;
         
@@ -414,73 +330,41 @@ static void Scan_DestroyInput(Scan_Input<T> *input)
     CUDACheck(cudaFree(input->d_scratch));
 }
 
-template <typename T>
-static void InclusiveScan1(Scan_Input<T> *input, cudaStream_t stream)
-{
-    u32 k = input->pass_input_count;
-    u64 elements_per_block = COARSE_FACTOR*BLOCK_DIM;
-
-    for (u32 pass = 0; pass < k; ++pass) // k upsweeps
-    {
-        Scan_PassInput<T> *pass_input = input->pass_inputs + pass;
-        int grid_dim = (pass_input->element_count + elements_per_block - 1)/elements_per_block;
-        CUDACheck((InclusiveScanUpsweep<T><<<grid_dim, BLOCK_DIM, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
-    }
-
-    for (s32 pass = k - 2; pass >= 0; --pass) // k - 1 downsweeps
-    {
-        Scan_PassInput<T> *pass_input = input->pass_inputs + pass;
-        int grid_dim = (pass_input->element_count + elements_per_block - 1)/elements_per_block;
-        CUDACheck((InclusiveScanDownsweep<T><<<grid_dim, BLOCK_DIM, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
-    }
-}
-
-template <typename T>
-static void ExclusiveScan1(Scan_Input<T> *input, cudaStream_t stream)
-{
-    u32 k = input->pass_input_count;
-    u64 elements_per_block = COARSE_FACTOR*BLOCK_DIM;
-
-    for (u32 pass = 0; pass < k; ++pass) // k upsweeps
-    {
-        Scan_PassInput<T> *pass_input = input->pass_inputs + pass;
-        int grid_dim = (pass_input->element_count + elements_per_block - 1)/elements_per_block;
-        CUDACheck((ExclusiveScanUpsweep<T><<<grid_dim, BLOCK_DIM, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
-    }
-
-    for (s32 pass = k - 2; pass >= 0; --pass) // k - 1 downsweeps
-    {
-        Scan_PassInput<T> *pass_input = input->pass_inputs + pass;
-        int grid_dim = (pass_input->element_count + elements_per_block - 1)/elements_per_block;
-        CUDACheck((ExclusiveScanDownsweep<T><<<grid_dim, BLOCK_DIM, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
-    }
-}
-
-template <typename T, b32 inclusive>
-static void Scan2(Scan_Input<T> *input, cudaStream_t stream)
+template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
+static void Scan(Scan_Input<T> *input, cudaStream_t stream)
 {
     u32 k = input->pass_input_count;
 
     for (u32 pass = 0; pass < k; ++pass) // k upsweeps
     {
         Scan_PassInput<T> *pass_input = input->pass_inputs + pass;
-        int grid_dim = (pass_input->element_count + ELEMENTS_PER_BLOCK - 1)/ELEMENTS_PER_BLOCK;
-        CUDACheck((Scan_Upsweep<T, inclusive><<<grid_dim, BLOCK_DIM, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
+
+        u64 elements_per_block = coarse_factor*block_dim;
+        if (pass_input->work_efficient)
+            elements_per_block *= 2;
+
+        int grid_dim = (pass_input->element_count + elements_per_block - 1)/elements_per_block;
+        CUDACheck((Scan_Upsweep<T, inclusive, block_dim, coarse_factor><<<grid_dim, block_dim, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary, pass_input->work_efficient)));
     }
 
     for (s32 pass = k - 2; pass >= 0; --pass) // k - 1 downsweeps
     {
         Scan_PassInput<T> *pass_input = input->pass_inputs + pass;
-        int grid_dim = (pass_input->element_count + ELEMENTS_PER_BLOCK - 1)/ELEMENTS_PER_BLOCK;
-        CUDACheck((Scan_Downsweep<T, inclusive><<<grid_dim, BLOCK_DIM, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
+
+        u64 elements_per_block = coarse_factor*block_dim;
+        if (pass_input->work_efficient)
+            elements_per_block *= 2;
+
+        int grid_dim = (pass_input->element_count + elements_per_block - 1)/elements_per_block;
+        CUDACheck((Scan_Downsweep<T, inclusive, block_dim, coarse_factor><<<grid_dim, block_dim, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary, pass_input->work_efficient)));
     }
 }
 
 #include "benchmarking.cu"
-
-#include <thrust/scan.h>
-
 using InputType = int;
+
+#if 0
+#include <thrust/scan.h>
 
 template <typename T>
 void ThrustInclusiveScan(u64 count, T *input, T *output, cudaStream_t stream)
@@ -493,6 +377,7 @@ void ThrustExclusiveScan(u64 count, T *input, T *output, cudaStream_t stream)
 {
     thrust::exclusive_scan(thrust::cuda::par.on(stream), input, input + count, output);
 }
+#endif
 
 template <typename T>
 struct Data
@@ -501,6 +386,12 @@ struct Data
     T *h_array;
     T *d_array;
     Scan_Input<T> *input;
+};
+
+enum
+{
+    g_block_dim = 512,
+    g_coarse_factor = 8,
 };
 
 template <typename T>
@@ -518,7 +409,7 @@ static Data<T> *CreateData(Arena *arena, u64 count, cudaStream_t stream)
 
     CUDACheck(cudaStreamSynchronize(stream));
 
-    data->input = Scan_CreateInput(arena, data->count, data->d_array);
+    data->input = Scan_CreateInput<T, g_block_dim, g_coarse_factor>(arena, data->count, data->d_array);
 
     return data;
 }
@@ -549,8 +440,7 @@ static b32 ValidateGPUOutput(Arena *arena, Data<T> *data)
 template <typename T>
 static void FunctionToBenchmark(Data<T> *data, cudaStream_t stream)
 {
-    InclusiveScan1<T>(data->input, stream);
-    // Scan2<T, 1>(data->input, stream);
+    Scan<T, true, g_block_dim, g_coarse_factor>(data->input, stream);
     // ThrustInclusiveScan<T>(data->count, data->d_array, data->d_array, stream);
 }
 
@@ -599,9 +489,7 @@ static void TestScan()
             Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
             
             Data<int> *data = CreateData<int>(scratch.arena, count, 0);
-            Scan_Input<int> *input = Scan_CreateInput(scratch.arena, count, data->d_array);
-            InclusiveScan1<int>(input, 0);
-            // Scan2<int, 1>(input, 0);
+            Scan<int, true, g_block_dim, g_coarse_factor>(data->input, 0);
             
             int *gpu_output = PushArray(scratch.arena, int, count);
             CUDACheck(cudaMemcpy(gpu_output, data->d_array, count*sizeof(int), cudaMemcpyDeviceToHost));
@@ -636,9 +524,7 @@ static void TestScan()
             Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
 
             Data<int> *data = CreateData<int>(scratch.arena, count, 0);
-            Scan_Input<int> *input = Scan_CreateInput(scratch.arena, count, data->d_array);
-            ExclusiveScan1<int>(input, 0);
-            // Scan2<int, 0>(input, 0);
+            Scan<int, false, g_block_dim, g_coarse_factor>(data->input, 0);
             
             int *gpu_output = PushArray(scratch.arena, int, count);
             CUDACheck(cudaMemcpy(gpu_output, data->d_array, count*sizeof(int), cudaMemcpyDeviceToHost));

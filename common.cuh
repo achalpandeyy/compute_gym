@@ -117,6 +117,7 @@ static void GetPeakMeasurements(f64 *peak_gbps, f64 *peak_gflops, bool print_dev
     {
         printf("Device name: %s\n", device_prop.name);
         printf("Compute capability: %d.%d\n", device_prop.major, device_prop.minor);
+        printf("Total CUDA cores: %d\n", device_prop.multiProcessorCount*GetCUDACoresPerSM(device_prop.major, device_prop.minor));
 
         printf("Total Global Memory: %.2f GB\n", (device_prop.totalGlobalMem/(1024.f*1024.f*1024.f)));
         printf("Shared Memory (per block): %.2f KB\n", (device_prop.sharedMemPerBlock/1024.f));

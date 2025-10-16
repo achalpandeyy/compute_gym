@@ -27,6 +27,7 @@ nvcc.exe \
 -lineinfo \
 --generate-code=arch=${virtual_arch},code="[${real_arch},${virtual_arch}]" \
 -O3 \
+--diag-suppress 186 \
 -Xcompiler "/std:c++17 /O2 /Oi /Ot /Zi /Zc:preprocessor" \
 ../"${target}".cu \
 -o "${target}".exe

@@ -1,7 +1,7 @@
 template <typename T>
 struct Data;
 
-template <typename T>
+template <typename T, u32 elements_per_block>
 static Data<T> *CreateData(Arena *arena, u64 count, cudaStream_t stream);
 
 template <typename T>
@@ -10,7 +10,7 @@ static void DestroyData(Data<T> *data);
 template <typename T>
 static b32 ValidateGPUOutput(Arena *arena, Data<T> *data);
 
-template <typename T>
+template <typename T, u32 block_dim, u32 coarse_factor>
 static void FunctionToBenchmark(Data<T> *data, cudaStream_t stream);
 
 __global__ void CopyKernel(u64 count, f32 *dst, f32 *src)
@@ -35,7 +35,7 @@ static void FlushL2Cache()
 
 // NOTE(achal): Inspired by:
 // https://github.com/gpu-mode/reference-kernels/blob/750868c61cd81fdcec8826a0cfcf4cb7fea064da/problems/pmpp_v2/eval.py#L237
-template <typename T>
+template <typename T, u32 block_dim, u32 coarse_factor>
 void Benchmark(f64 peak_gbps, f64 peak_gflops, const char *file_name)
 {
     FILE *file = 0;
@@ -55,8 +55,8 @@ void Benchmark(f64 peak_gbps, f64 peak_gflops, const char *file_name)
     {
         Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
 
-        Data<T> *data = CreateData<T>(scratch.arena, 1 << 18, 0);
-        FunctionToBenchmark(data, 0);
+        Data<T> *data = CreateData<T, block_dim*coarse_factor>(scratch.arena, 1 << 18, 0);
+        FunctionToBenchmark<T, block_dim, coarse_factor>(data, 0);
         DestroyData<T>(data);
         
         ScratchEnd(&scratch);
@@ -70,9 +70,9 @@ void Benchmark(f64 peak_gbps, f64 peak_gflops, const char *file_name)
         b32 correct = 1;
         {
             Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
-            Data<T> *data = CreateData<T>(scratch.arena, array_count, 0);
+            Data<T> *data = CreateData<T, block_dim*coarse_factor>(scratch.arena, array_count, 0);
 
-            FunctionToBenchmark(data, 0);
+            FunctionToBenchmark<T, block_dim, coarse_factor>(data, 0);
 
             if (!ValidateGPUOutput<T>(scratch.arena, data))
             {
@@ -109,11 +109,11 @@ void Benchmark(f64 peak_gbps, f64 peak_gflops, const char *file_name)
             {
                 {
                     Scratch data_scratch = ScratchBegin(scratch.arena);
-                    Data<T> *data = CreateData<T>(data_scratch.arena, array_count, stream);
+                    Data<T> *data = CreateData<T, block_dim*coarse_factor>(data_scratch.arena, array_count, stream);
                     
                     FlushL2Cache();
                     CUDACheck(cudaEventRecord(start_event, stream));
-                    FunctionToBenchmark(data, stream);
+                    FunctionToBenchmark<T, block_dim, coarse_factor>(data, stream);
                     CUDACheck(cudaEventRecord(stop_event, stream));
                     CUDACheck(cudaEventSynchronize(stop_event));
                     

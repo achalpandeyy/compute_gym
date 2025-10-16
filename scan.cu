@@ -205,7 +205,7 @@ __global__ void Scan_Upsweep(u64 count, T *array, T *summary)
 #else
     T segment_result = SegmentScan_KoggeStone<T, inclusive, block_dim, coarse_factor>(count, array);
 #endif
-    if (summary && (threadIdx.x == block_dim - 1))
+    if (summary && (threadIdx.x == (block_dim - 1)))
         summary[blockIdx.x] = segment_result;
 }
 
@@ -264,15 +264,15 @@ static Scan_Input<T> *Scan_CreateInput(Arena *arena, u64 count, T *d_array)
 
     // Allocate scratch
     {
+        u64 element_count = count;
         u64 size = 0ull;
-
-        // Add the number of elements for the first pass..
-        u64 out_count = (count + elements_per_block - 1)/elements_per_block;
-        size += out_count*sizeof(*input->d_scratch);
-
-        // Add the number of elements for the second pass.. and we are done because we can just ping-pong.
-        out_count = (out_count + elements_per_block - 1)/elements_per_block;
-        size += out_count*sizeof(*input->d_scratch);
+        for (u32 i = 0; i < input->pass_input_count - 1; ++i)
+        {
+            u64 grid_dim = (element_count + elements_per_block - 1)/elements_per_block;
+            size += grid_dim*sizeof(*input->d_scratch);
+            
+            element_count = grid_dim;
+        }
 
         CUDACheck(cudaMalloc(&input->d_scratch, size));
     }
@@ -280,18 +280,17 @@ static Scan_Input<T> *Scan_CreateInput(Arena *arena, u64 count, T *d_array)
     input->pass_input_count = (u32)ceilf(logf(count)/logf(elements_per_block));
     input->pass_inputs = PushArrayZero(arena, Scan_PassInput<T>, input->pass_input_count);
 
-    int out_count = (count + elements_per_block - 1)/elements_per_block; // output of the first pass
-    T *d_pingpong[] = {input->d_scratch, input->d_scratch + out_count};
     u64 element_count = count;
-
+    u64 scratch_offset = 0;
     for (u32 i = 0; i < input->pass_input_count; ++i)
     {
         Scan_PassInput<T> *pass_input = input->pass_inputs + i;
         pass_input->d_array = d_array;
-        pass_input->d_summary = d_pingpong[i % 2];
+        pass_input->d_summary = input->d_scratch + scratch_offset;
         pass_input->element_count = element_count;
 
-        int grid_dim = (element_count + elements_per_block - 1)/elements_per_block;
+        u64 grid_dim = (element_count + elements_per_block - 1)/elements_per_block;
+        scratch_offset += grid_dim;
         
         d_array = pass_input->d_summary;
         element_count = grid_dim;
@@ -480,7 +479,7 @@ static void TestScan()
                 {
                     if (1)
                     {
-                        for (int _i = 0; _i < count; _i++)
+                        for (int _i = 0; _i < 1024; _i++)
                         {
                             // if ((_i % 4) == 3)
                                 printf("%d, ", gpu_output[_i]);
@@ -516,11 +515,11 @@ static void TestScan()
                 {
                     if (1)
                     {
-                        for (int _i = 0; _i < 100; _i++)
-                        {
-                            printf("%d, ", gpu_output[_i]);
-                        }
-                        printf("\t...\t%d\n", gpu_output[count - 1]);
+                        // for (int _i = 0; _i < 100; _i++)
+                        // {
+                        //     printf("%d, ", gpu_output[_i]);
+                        // }
+                        // printf("\t...\t%d\n", gpu_output[count - 1]);
                     }
                     printf("[FAIL] Result[%d] (GPU): %d \tExpected: %d\n", i, gpu_output[i], data->h_array[i]);
                     exit(1);

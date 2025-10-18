@@ -1,37 +1,42 @@
 #!/bin/bash
 
-target=$1
+for arg in "$@"; do declare $arg="1"; done
 
-if [ -z "$target" ]; then
-    echo "No build target specified"
-    exit 1
-fi
+if [ ! -v clang ];   then msvc=1;  fi
+if [ ! -v release ]; then debug=1; fi
+
+if [ -v msvc ];    then echo "[msvc compile]";  fi
+if [ -v clang ];   then echo "[clang compile]"; fi
+if [ -v debug ];   then echo "[debug mode]";    fi
+if [ -v release ]; then echo "[release mode]";  fi
+if [ -v reduce ];  then echo "reduce"; fi
+if [ -v scan ];    then echo "scan";   fi
 
 build_dir="build" && mkdir -p ${build_dir}
 pushd $build_dir > /dev/null 2>&1
 
+msvc_common="/std:c++17 /Zc:preprocessor"
+msvc_debug="$msvc_common /Od /Zi /D BUILD_DEBUG"
+msvc_release="$msvc_common /O2 /Oi /Ot /DNDEBUG"
+
+if [ -v debug ]; then host_compile="$msvc_debug"; fi
+if [ -v release ]; then host_compile="$msvc_release"; fi
+
 virtual_arch="compute_89"
 real_arch="sm_89"
 
-# NOTE(achal): Passing -DNDEBUG to nvcc.exe disables host side asserts as well.
+# NOTE(achal): Defining macros for NVCC defines them for the host side as well.
+nvcc_common="nvcc.exe -I ../../../cccl/ -I ../../../cccl/libcudacxx/include -I ../../../cccl/cub -I ../../../cccl/thrust --use-local-env -std=c++17 --generate-code=arch=${virtual_arch},code=[${real_arch},${virtual_arch}] --diag-suppress 186 -Xcompiler \"$host_compile\""
+nvcc_debug="$nvcc_common -lineinfo -O0"
+nvcc_release="$nvcc_common -O3"
 
-../../../tools/ctime/ctime.exe -begin .${target}.ctm
+if [ -v debug ];   then compile="$nvcc_debug";   fi
+if [ -v release ]; then compile="$nvcc_release"; fi
+out="-o"
 
-nvcc.exe \
--I "../../../cccl/" \
--I "../../../cccl/libcudacxx/include" \
--I "../../../cccl/cub" \
--I "../../../cccl/thrust" \
---use-local-env \
--std=c++17 \
--lineinfo \
---generate-code=arch=${virtual_arch},code="[${real_arch},${virtual_arch}]" \
--O3 \
---diag-suppress 186 \
--Xcompiler "/std:c++17 /O2 /Oi /Ot /Zi /Zc:preprocessor" \
-../"${target}".cu \
--o "${target}".exe
+ctime="../../../tools/ctime/ctime.exe"
 
-../../../tools/ctime/ctime.exe -end .${target}.ctm $?
+if [ -v reduce ]; then $ctime -begin .reduce.ctm; eval "$compile ../reduce.cu $out reduce"; $ctime -end .reduce.ctm $?; fi
+if [ -v scan ];   then $ctime -begin .scan.ctm;   eval "$compile ../scan.cu   $out scan";   $ctime -end .scan.ctm $?;   fi
 
 popd > /dev/null 2>&1

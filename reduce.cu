@@ -145,8 +145,11 @@ int main(int argc, char **argv)
     printf("Throughput (Peak):\t%.2f GFLOPS\n", peak_gflops);
     printf("Arithmetic intensity (Peak):\t%.2f FLOPS/byte\n", peak_gflops/peak_gbps);
 
-    enum { block_dim = 1024, coarse_factor = 32 };
-    Benchmark<InputType, block_dim, coarse_factor>(peak_gbps, peak_gflops, file_name);
+    if (file_name)
+    {
+        enum { block_dim = 1024, coarse_factor = 32 };
+        Benchmark<InputType, block_dim, coarse_factor>(peak_gbps, peak_gflops, file_name);
+    }
 
     return 0;
 }

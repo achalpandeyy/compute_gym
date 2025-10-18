@@ -38,9 +38,12 @@ static void FlushL2Cache()
 template <typename T, u32 block_dim, u32 coarse_factor>
 void Benchmark(f64 peak_gbps, f64 peak_gflops, const char *file_name)
 {
-    FILE *file = 0;
-    if (file_name)
-        file = fopen(file_name, "wb");
+#if BUILD_DEBUG
+    printf("Warning: Benchmarking in debug mode. Results will be inaccurate.\n");
+#endif
+
+    Assert(file_name);
+    FILE *file = fopen(file_name, "wb");
 
     if (file)
     {
@@ -170,6 +173,5 @@ void Benchmark(f64 peak_gbps, f64 peak_gflops, const char *file_name)
         }          
     }
 
-    if (file)
-        fclose(file);
+    fclose(file);
 }

@@ -35,6 +35,7 @@ inline static void GetCUDAErrorDetails(cudaError_t error, char const **error_nam
         *error_string = cudaGetErrorString(error);
 }
 
+#if BUILD_DEBUG
 #define CUDACheck_(fn_call, line)\
 {\
     cudaError_t prev_error = cudaGetLastError();\
@@ -47,6 +48,7 @@ inline static void GetCUDAErrorDetails(cudaError_t error, char const **error_nam
         prev_error = cudaGetLastError();\
     }\
     fn_call;\
+    cudaDeviceSynchronize();\
     cudaError_t error = cudaGetLastError();\
     if (error != cudaSuccess)\
     {\
@@ -56,6 +58,10 @@ inline static void GetCUDAErrorDetails(cudaError_t error, char const **error_nam
         printf("CUDA Error on line %u: %s %s", line, error_name, error_string);\
     }\
 }
+#else
+#define CUDACheck_(fn_call, line) (fn_call);
+#endif
+
 #define CUDACheck(...) CUDACheck_(__VA_ARGS__, __LINE__)
 
 static inline u32 GetCUDACoresPerSM(int major, int minor)

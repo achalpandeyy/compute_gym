@@ -3,7 +3,7 @@
 
 #include "common.cuh"
 
-#define SEGMENTED_SCAN 0
+#define SEGMENTED_SCAN 1
 
 template <typename T>
 static void SequentialInclusiveScan(int count, T *array)
@@ -84,14 +84,19 @@ __device__ T SegmentScan_KoggeStone(u64 count, T *array)
     }
     __syncthreads();
 
-    // TODO(achal): Only one thread should issue a global memory read and broadcast i.e. store into shared memory
     T segment_result = segment[(block_dim - 1)*coarse_factor + (coarse_factor - 1)];
     if constexpr (!inclusive)
     {
-        u64 index = blockIdx.x*coarse_factor*block_dim + (block_dim - 1)*coarse_factor + (coarse_factor - 1);
-        if (index > count - 1)
-            index = count - 1;
-        segment_result += array[index];
+        __shared__ T segment_result_shared;
+        if (threadIdx.x == block_dim - 1)
+        {
+            u64 index = blockIdx.x*coarse_factor*block_dim + (block_dim - 1)*coarse_factor + (coarse_factor - 1);
+            if (index > count - 1)
+                index = count - 1;
+            segment_result_shared = segment_result + array[index];
+        }
+        __syncthreads();
+        segment_result = segment_result_shared;
     }
 
     for (int i = 0; i < coarse_factor; ++i)
@@ -183,14 +188,19 @@ __device__ T SegmentScan_BrentKung(u64 count, T *array)
         __syncthreads();
     }
 
-    // TODO(achal): Only one thread should issue a global memory read and broadcast i.e. store into shared memory
     T segment_result = segment[(block_dim - 1)*2*coarse_factor + (2*coarse_factor - 1)];
     if constexpr (!inclusive)
     {
-        u64 index = blockIdx.x*2*coarse_factor*block_dim + (block_dim - 1)*2*coarse_factor + (2*coarse_factor - 1);
-        if (index > count - 1)
-            index = count - 1;
-        segment_result += array[index];
+        __shared__ T segment_result_shared;
+        if (threadIdx.x == block_dim - 1)
+        {
+            u64 index = blockIdx.x*2*coarse_factor*block_dim + (block_dim - 1)*2*coarse_factor + (2*coarse_factor - 1);
+            if (index > count - 1)
+                index = count - 1;
+            segment_result_shared = segment_result + array[index];
+        }
+        __syncthreads();
+        segment_result = segment_result_shared;
     }
 
     // step II.II: downward
@@ -324,14 +334,19 @@ __global__ void Scan3Kernel(u64 count, T *array, int *flags, T *block_sums, u64 
     }
     __syncthreads();
 
-    // TODO(achal): Only one thread should do this
     T segment_result = segment[(block_dim - 1)*coarse_factor + (coarse_factor - 1)];
     if constexpr (!inclusive)
     {
-        u64 index = block_id*coarse_factor*block_dim + (block_dim - 1)*coarse_factor + (coarse_factor - 1);
-        if (index > count - 1)
-            index = count - 1;
-        segment_result += array[index];
+        __shared__ T segment_result_shared;
+        if (threadIdx.x == block_dim - 1)
+        {
+            u64 index = block_id*coarse_factor*block_dim + (block_dim - 1)*coarse_factor + (coarse_factor - 1);
+            if (index > count - 1)
+                index = count - 1;
+            segment_result_shared = segment_result + array[index];
+        }
+        __syncthreads();
+        segment_result = segment_result_shared;
     }
 
     __shared__ T prev_block_sums;
@@ -600,10 +615,10 @@ static void FunctionToBenchmark(Data<T> *data, cudaStream_t stream)
     // ThrustInclusiveScan<T>(data->count, data->d_array, data->d_array, stream);
 
 #if SEGMENTED_SCAN
-    // Scan1<T, true, block_dim, coarse_factor>(data->input, stream);
+    Scan1<T, true, block_dim, coarse_factor>(data->input, stream);
     // Scan2<T, true, block_dim, coarse_factor>(data->input, stream);
 #else
-    // Scan3<T, true, block_dim, coarse_factor>(data->input, stream);
+    Scan3<T, true, block_dim, coarse_factor>(data->input, stream);
 #endif
 }
 
@@ -631,7 +646,7 @@ int main(int argc, char **argv)
     f64 peak_gflops = 0.0;
     GetPeakMeasurements(&peak_gbps, &peak_gflops, true);
 
-    if (1)
+    if (0)
     {
         Test_ScanSuite();
         printf("All tests passed\n");

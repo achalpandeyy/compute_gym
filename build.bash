@@ -36,7 +36,7 @@ out="-o"
 
 ctime="../../../tools/ctime/ctime.exe"
 
-if [ -v reduce ]; then $ctime -begin .reduce.ctm; eval "$compile ../reduce.cu $out reduce"; $ctime -end .reduce.ctm $?; fi
-if [ -v scan ];   then $ctime -begin .scan.ctm;   eval "$compile ../scan.cu   $out scan";   $ctime -end .scan.ctm $?;   fi
+if [ -v reduce ];    then $ctime -begin .reduce.ctm;    eval "$compile ../reduce.cu    $out reduce";    $ctime -end .reduce.ctm $?;    fi
+if [ -v scan ];      then $ctime -begin .scan.ctm;      eval "$compile ../scan.cu      $out scan";      $ctime -end .scan.ctm $?;      fi
 
 popd > /dev/null 2>&1

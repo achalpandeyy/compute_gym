@@ -363,12 +363,9 @@ __global__ void Scan3Kernel(u64 count, T *array, int *flags, T *block_sums, u64 
             __threadfence();
         }
         
-        if (block_id > 0)
-            prev_block_sums = block_sums[block_id - 1];
-        else
-            prev_block_sums = T(0);
+        prev_block_sums = block_sums[block_id];
 
-        block_sums[block_id] = prev_block_sums + segment_result;
+        block_sums[block_id + 1] = prev_block_sums + segment_result;
 
         __threadfence();
         atomicAdd(&flags[block_id + 1], 1);
@@ -458,6 +455,9 @@ static Scan_Input<T> *Scan_CreateInput(Arena *arena, u64 count, T *d_array)
         // TODO(achal): It will be better if we can allocate all of this in one go,
         // but we need to be congizant about alignment requirements.
 
+        // Scratch scratch = ScratchBegin(arena
+        // u64 *messages = PushArray(scratch.arena, grid_dim)
+
         u64 grid_dim = (count + elements_per_block - 1)/elements_per_block;
 
         // flags
@@ -545,7 +545,7 @@ static void Scan3(Scan_Input<T> *input, cudaStream_t stream)
 }
 
 #include "benchmarking.cu"
-using InputType = f64;
+using InputType = int;
 
 #if BENCHMARK_THRUST
 #include <thrust/scan.h>
@@ -625,8 +625,8 @@ static void FunctionToBenchmark(Data<T> *data, cudaStream_t stream)
     ThrustInclusiveScan<T>(data->count, data->d_array, data->d_array, stream);
 #else
 #if SEGMENTED_SCAN
-    Scan1<T, true, block_dim, coarse_factor>(data->input, stream);
-    // Scan2<T, true, block_dim, coarse_factor>(data->input, stream);
+    // Scan1<T, true, block_dim, coarse_factor>(data->input, stream);
+    Scan2<T, true, block_dim, coarse_factor>(data->input, stream);
 #else
     Scan3<T, true, block_dim, coarse_factor>(data->input, stream);
 #endif
@@ -659,7 +659,8 @@ int main(int argc, char **argv)
 
     if (1)
     {
-        Test_ScanSuite();
+        // Test_ScanSuite();
+        Test_Scan<512, 5>((Test_ScanAlgorithm)Test_ScanAlgorithm_1);
         printf("All tests passed\n");
     }
     
@@ -669,7 +670,7 @@ int main(int argc, char **argv)
 
     if (file_name)
     {
-        enum { block_dim = 512, coarse_factor = 4 };
+        enum { block_dim = 512, coarse_factor = 5 };
         Benchmark<InputType, block_dim, coarse_factor>(peak_gbps, peak_gflops, file_name);
     }
 
@@ -764,7 +765,11 @@ static void Test_ScanSuite()
     {
         Test_Scan<block_dim, 1>((Test_ScanAlgorithm)algorithm);
         Test_Scan<block_dim, 2>((Test_ScanAlgorithm)algorithm);
+        Test_Scan<block_dim, 3>((Test_ScanAlgorithm)algorithm);
         Test_Scan<block_dim, 4>((Test_ScanAlgorithm)algorithm);
+        Test_Scan<block_dim, 5>((Test_ScanAlgorithm)algorithm);
+        Test_Scan<block_dim, 6>((Test_ScanAlgorithm)algorithm);
+        Test_Scan<block_dim, 7>((Test_ScanAlgorithm)algorithm);
         Test_Scan<block_dim, 8>((Test_ScanAlgorithm)algorithm);
     }
 }

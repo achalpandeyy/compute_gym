@@ -65,7 +65,7 @@ void Benchmark(f64 peak_gbps, f64 peak_gflops, const char *file_name)
         ScratchEnd(&scratch);
     }
 
-    for (u32 exp = 1; exp <= 30; ++exp)
+    for (u32 exp = 1; exp <= 28; ++exp)
     {
         u64 array_count = 1 << exp;
 

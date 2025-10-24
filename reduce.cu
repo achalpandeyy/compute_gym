@@ -119,6 +119,7 @@ template <typename T, u32 block_dim, u32 coarse_factor>
 static void FunctionToBenchmark(Data<T> *data, cudaStream_t stream)
 {
     Reduce<T, block_dim, coarse_factor>(data->count, data->d_in, data->d_out, stream);
+    // ThrustReduce(data->count, data->d_in, data->d_out, stream);
 }
 
 static void Test_Reduce();
@@ -131,7 +132,7 @@ int main(int argc, char **argv)
         file_name = argv[1];
     }
 
-    if (1)
+    if (0)
     {
         Test_Reduce();
         printf("All tests passed\n");
@@ -147,7 +148,7 @@ int main(int argc, char **argv)
 
     if (file_name)
     {
-        enum { block_dim = 1024, coarse_factor = 32 };
+        enum { block_dim = 512, coarse_factor = 4 };
         Benchmark<InputType, block_dim, coarse_factor>(peak_gbps, peak_gflops, file_name);
     }
 

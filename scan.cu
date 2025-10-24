@@ -271,8 +271,70 @@ __global__ void Scan2_Downsweep(u64 count, T *array, T *summary)
     }
 }
 
+template <typename T>
+struct Tile
+{    
+    // NOTE(achal): If we are concerned about memory usage we can make the flag u8 and
+    // the atomic loading code slightly more complicated to handle the sizeof(Tile<T>)
+    // equals 4 case.
+    u32 flag;
+    T value;
+};
+
+template <typename T>
+__device__ Tile<T> LoadTile(Tile<T> *addr)
+{
+    Tile<T> tile = {0, 0};
+    if constexpr (sizeof(tile) == 16)
+    {
+        u64 tile_data[2];
+        tile_data[0] = atomicAdd((u64 *)addr, 0);
+        __threadfence();
+        tile_data[1] = atomicAdd((u64 *)addr + 1, 0);
+
+        // flag | pad | value
+        tile.flag = tile_data[0] & 0xFFFFFFFF;
+        tile.value = (T)(tile_data[1]);
+    }
+    else if constexpr (sizeof(tile) == 8)
+    {
+        u64 tile_data = atomicAdd((u64 *)addr, 0);
+        tile.flag = tile_data & 0xFFFFFFFF;
+        tile.value = (T)((tile_data >> 32) & 0xFFFFFFFF);
+    }
+    else
+    {
+        static_assert(0);
+    }
+    return tile;
+}
+
+template <typename T>
+__device__ void StoreTile(Tile<T> *addr, Tile<T> tile)
+{
+    if constexpr (sizeof(tile) == 16)
+    {
+        u64 tile_data[2];
+        tile_data[1] = (u64)tile.value;
+        tile_data[0] = tile_data[0] | tile.flag;
+
+        atomicAdd((u64 *)addr + 1, tile_data[1]);
+        __threadfence();
+        atomicAdd((u64 *)addr, tile_data[0]);
+    }
+    else if constexpr (sizeof(tile) == 8)
+    {
+        u64 packed = ((u64)tile.value << 32) | tile.flag;
+        atomicAdd((u64 *)addr, packed);
+    }
+    else
+    {
+        static_assert(0);
+    }
+}
+
 template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
-__global__ void Scan3Kernel(u64 count, T *array, int *flags, T *block_sums, u64 *block_id_counter)
+__global__ void Scan3Kernel(u64 count, T *array, Tile<T> *tiles, u64 *block_id_counter)
 {
     __shared__ u64 block_id;
     if (threadIdx.x == 0)
@@ -352,23 +414,17 @@ __global__ void Scan3Kernel(u64 count, T *array, int *flags, T *block_sums, u64 
     }
 
     __shared__ T prev_block_sums;
-
     if (threadIdx.x == 0)
     {
-        int flag = atomicAdd(&flags[block_id], 0);
-        __threadfence();
-        while (flag == 0)
+        Tile<T> src_tile = LoadTile(&tiles[block_id]);
+        while (src_tile.flag == 0)
         {
-            flag = atomicAdd(&flags[block_id], 0);
-            __threadfence();
+            src_tile = LoadTile(&tiles[block_id]);
         }
         
-        prev_block_sums = block_sums[block_id];
-
-        block_sums[block_id + 1] = prev_block_sums + segment_result;
-
-        __threadfence();
-        atomicAdd(&flags[block_id + 1], 1);
+        prev_block_sums = src_tile.value;
+        Tile<T> dst_tile = {1, prev_block_sums + segment_result};
+        StoreTile(&tiles[block_id + 1], dst_tile);
     }
     __syncthreads();
 
@@ -399,8 +455,7 @@ struct Scan_Input
 #else
     u64 count;
     T *d_array;
-    int *flags;
-    T *block_sums;
+    Tile<T> *tiles;
     u64 *block_id_counter;
 #endif
 };
@@ -455,23 +510,21 @@ static Scan_Input<T> *Scan_CreateInput(Arena *arena, u64 count, T *d_array)
         // TODO(achal): It will be better if we can allocate all of this in one go,
         // but we need to be congizant about alignment requirements.
 
-        // Scratch scratch = ScratchBegin(arena
-        // u64 *messages = PushArray(scratch.arena, grid_dim)
+        Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
 
         u64 grid_dim = (count + elements_per_block - 1)/elements_per_block;
+        
+        Tile<T> *tiles = PushArrayZero(scratch.arena, Tile<T>, grid_dim);
+        tiles[0].flag = 1;
 
-        // flags
-        CUDACheck(cudaMalloc(&input->flags, grid_dim*sizeof(*input->flags)));
-        CUDACheck(cudaMemset(input->flags, 0, grid_dim*sizeof(*input->flags)));
-        CUDACheck(cudaMemset(input->flags, 1, 1*sizeof(*input->flags)));
-
-        // block_sums
-        CUDACheck(cudaMalloc(&input->block_sums, grid_dim*sizeof(*input->block_sums)));
-        CUDACheck(cudaMemset(input->block_sums, 0, grid_dim*sizeof(*input->block_sums)));
+        CUDACheck(cudaMalloc(&input->tiles, grid_dim*sizeof(*input->tiles)));
+        CUDACheck(cudaMemcpy(input->tiles, tiles, grid_dim*sizeof(*input->tiles), cudaMemcpyHostToDevice));
         
         // block_id_counter
         CUDACheck(cudaMalloc(&input->block_id_counter, sizeof(u64)));
         CUDACheck(cudaMemset(input->block_id_counter, 0, sizeof(u64)));
+
+        ScratchEnd(&scratch);
     }
 #endif
 
@@ -484,8 +537,7 @@ static void Scan_DestroyInput(Scan_Input<T> *input)
 #if SEGMENTED_SCAN
     CUDACheck(cudaFree(input->d_scratch));
 #else
-    CUDACheck(cudaFree(input->flags));
-    CUDACheck(cudaFree(input->block_sums));
+    CUDACheck(cudaFree(input->tiles));
     CUDACheck(cudaFree(input->block_id_counter));
 #endif
 }
@@ -541,7 +593,7 @@ static void Scan3(Scan_Input<T> *input, cudaStream_t stream)
 {
     u32 elements_per_block = coarse_factor*block_dim;
     u64 grid_dim = (input->count + elements_per_block - 1)/elements_per_block;
-    CUDACheck((Scan3Kernel<T, inclusive, block_dim, coarse_factor><<<grid_dim, block_dim, 0, stream>>>(input->count, input->d_array, input->flags, input->block_sums, input->block_id_counter)));
+    CUDACheck((Scan3Kernel<T, inclusive, block_dim, coarse_factor><<<grid_dim, block_dim, 0, stream>>>(input->count, input->d_array, input->tiles, input->block_id_counter)));
 }
 
 #include "benchmarking.cu"
@@ -657,7 +709,7 @@ int main(int argc, char **argv)
     f64 peak_gflops = 0.0;
     GetPeakMeasurements(&peak_gbps, &peak_gflops, true);
 
-    if (1)
+    if (0)
     {
         // Test_ScanSuite();
         Test_Scan<512, 5>((Test_ScanAlgorithm)Test_ScanAlgorithm_1);

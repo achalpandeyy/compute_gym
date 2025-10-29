@@ -293,14 +293,16 @@ __device__ Tile<T> LoadTile(Tile<T> *addr)
         tile_data[1] = atomicAdd((u64 *)addr + 1, 0);
 
         // flag | pad | value
-        tile.flag = tile_data[0] & 0xFFFFFFFF;
-        tile.value = (T)(tile_data[1]);
+        tile.flag = (u32)(tile_data[0] & 0xFFFFFFFF);
+        tile.value = *reinterpret_cast<T *>(&tile_data[1]);
     }
     else if constexpr (sizeof(tile) == 8)
     {
         u64 tile_data = atomicAdd((u64 *)addr, 0);
-        tile.flag = tile_data & 0xFFFFFFFF;
-        tile.value = (T)((tile_data >> 32) & 0xFFFFFFFF);
+        tile.flag = (u32)(tile_data & 0xFFFFFFFF);
+        
+        u32 tile_value_u32 = (u32)((tile_data >> 32) & 0xFFFFFFFF);
+        tile.value = *reinterpret_cast<T *>(&tile_value_u32);
     }
     else
     {
@@ -315,7 +317,7 @@ __device__ void StoreTile(Tile<T> *addr, Tile<T> tile)
     if constexpr (sizeof(tile) == 16)
     {
         u64 tile_data[2];
-        tile_data[1] = (u64)tile.value;
+        tile_data[1] = *reinterpret_cast<u64 *>(&tile.value);
         tile_data[0] = tile_data[0] | tile.flag;
 
         atomicAdd((u64 *)addr + 1, tile_data[1]);
@@ -324,7 +326,8 @@ __device__ void StoreTile(Tile<T> *addr, Tile<T> tile)
     }
     else if constexpr (sizeof(tile) == 8)
     {
-        u64 packed = ((u64)tile.value << 32) | tile.flag;
+        u32 tile_value_u32 = *reinterpret_cast<u32 *>(&tile.value);
+        u64 packed = ((u64)tile_value_u32 << 32) | tile.flag;
         atomicAdd((u64 *)addr, packed);
     }
     else
@@ -677,8 +680,8 @@ static void FunctionToBenchmark(Data<T> *data, cudaStream_t stream)
     ThrustInclusiveScan<T>(data->count, data->d_array, data->d_array, stream);
 #else
 #if SEGMENTED_SCAN
-    // Scan1<T, true, block_dim, coarse_factor>(data->input, stream);
-    Scan2<T, true, block_dim, coarse_factor>(data->input, stream);
+    Scan1<T, true, block_dim, coarse_factor>(data->input, stream);
+    // Scan2<T, true, block_dim, coarse_factor>(data->input, stream);
 #else
     Scan3<T, true, block_dim, coarse_factor>(data->input, stream);
 #endif
@@ -722,7 +725,7 @@ int main(int argc, char **argv)
 
     if (file_name)
     {
-        enum { block_dim = 512, coarse_factor = 5 };
+        enum { block_dim = 512, coarse_factor = 23 };
         Benchmark<InputType, block_dim, coarse_factor>(peak_gbps, peak_gflops, file_name);
     }
 

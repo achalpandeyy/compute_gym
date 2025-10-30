@@ -3,8 +3,11 @@
 
 #include "common.cuh"
 
-#define BENCHMARK_THRUST 0
-#define SEGMENTED_SCAN 0
+#define SEGMENTED_KOGGE_STONE_SCAN 0
+#define SEGMENTED_BRENT_KUNG_SCAN 1
+#define SINGLE_PASS_SCAN 0
+#define CUB_SCAN 0
+#define THRUST_SCAN 0
 
 template <typename T>
 static void SequentialInclusiveScan(int count, T *array)
@@ -27,8 +30,31 @@ static void SequentialExclusiveScan(int count, T *array)
     }
 }
 
+#if SEGMENTED_KOGGE_STONE_SCAN
+enum
+{
+    g_block_dim = 512,
+    g_coarse_factor = 5,
+};
+
+template <typename T>
+struct Scan_PassInput
+{
+    T *d_array;
+    T *d_summary;
+    u64 element_count;
+};
+
+template <typename T>
+struct Scan_Input
+{
+    T *d_scratch;
+    u32 pass_input_count;
+    Scan_PassInput<T> *pass_inputs;
+};
+
 template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
-__device__ T SegmentScan_KoggeStone(u64 count, T *array)
+__device__ T SegmentScanKernel(u64 count, T *array)
 {
     __shared__ T segment[coarse_factor*block_dim];
 
@@ -113,15 +139,15 @@ __device__ T SegmentScan_KoggeStone(u64 count, T *array)
 }
 
 template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
-__global__ void Scan1_Upsweep(u64 count, T *array, T *summary)
+__global__ void ScanKernelUpsweep(u64 count, T *array, T *summary)
 {
-    T segment_result = SegmentScan_KoggeStone<T, inclusive, block_dim, coarse_factor>(count, array);
+    T segment_result = SegmentScanKernel<T, inclusive, block_dim, coarse_factor>(count, array);
     if (summary && (threadIdx.x == (block_dim - 1)))
         summary[blockIdx.x] = segment_result;
 }
 
 template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
-__global__ void Scan1_Downsweep(u64 count, T *array, T *summary)
+__global__ void ScanKernelDownsweep(u64 count, T *array, T *summary)
 {
     u8 elements_per_thread = coarse_factor;
 
@@ -142,8 +168,104 @@ __global__ void Scan1_Downsweep(u64 count, T *array, T *summary)
     }
 }
 
+template <typename T, u32 elements_per_block>
+static Scan_Input<T> *Scan_CreateInput(Arena *arena, u64 count, T *d_array)
+{
+    Scan_Input<T> *input = PushStructZero(arena, Scan_Input<T>);
+
+    input->pass_input_count = (u32)ceilf(logf(count)/logf(elements_per_block));
+    input->pass_inputs = PushArrayZero(arena, Scan_PassInput<T>, input->pass_input_count);
+
+    // Allocate scratch
+    {
+        u64 element_count = count;
+        u64 size = 0ull;
+        for (u32 i = 0; i < input->pass_input_count - 1; ++i)
+        {
+            u64 grid_dim = (element_count + elements_per_block - 1)/elements_per_block;
+            size += grid_dim*sizeof(*input->d_scratch);
+            
+            element_count = grid_dim;
+        }
+
+        CUDACheck(cudaMalloc(&input->d_scratch, size));
+    }
+
+    u64 element_count = count;
+    u64 scratch_offset = 0;
+    for (u32 i = 0; i < input->pass_input_count; ++i)
+    {
+        Scan_PassInput<T> *pass_input = input->pass_inputs + i;
+        pass_input->d_array = d_array;
+        pass_input->d_summary = input->d_scratch + scratch_offset;
+        pass_input->element_count = element_count;
+
+        u64 grid_dim = (element_count + elements_per_block - 1)/elements_per_block;
+        scratch_offset += grid_dim;
+        
+        d_array = pass_input->d_summary;
+        element_count = grid_dim;
+    }
+
+    input->pass_inputs[input->pass_input_count - 1].d_summary = 0; // the "top" pass doesn't require a summary
+
+    return input;
+}
+
+template <typename T>
+static void Scan_DestroyInput(Scan_Input<T> *input)
+{
+    CUDACheck(cudaFree(input->d_scratch));
+}
+
 template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
-__device__ T SegmentScan_BrentKung(u64 count, T *array)
+static void Scan(Scan_Input<T> *input, cudaStream_t stream)
+{
+    u32 elements_per_block = coarse_factor*block_dim;
+    u32 k = input->pass_input_count;
+
+    for (u32 pass = 0; pass < k; ++pass) // k upsweeps
+    {
+        Scan_PassInput<T> *pass_input = input->pass_inputs + pass;
+
+        int grid_dim = (pass_input->element_count + elements_per_block - 1)/elements_per_block;
+        CUDACheck((ScanKernelUpsweep<T, inclusive, block_dim, coarse_factor><<<grid_dim, block_dim, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
+    }
+
+    for (s32 pass = k - 2; pass >= 0; --pass) // k - 1 downsweeps
+    {
+        Scan_PassInput<T> *pass_input = input->pass_inputs + pass;
+
+        int grid_dim = (pass_input->element_count + elements_per_block - 1)/elements_per_block;
+        CUDACheck((ScanKernelDownsweep<T, inclusive, block_dim, coarse_factor><<<grid_dim, block_dim, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
+    }
+}
+
+#elif SEGMENTED_BRENT_KUNG_SCAN
+enum
+{
+    g_block_dim = 512,
+    g_coarse_factor = 5,
+};
+
+template <typename T>
+struct Scan_PassInput
+{
+    T *d_array;
+    T *d_summary;
+    u64 element_count;
+};
+
+template <typename T>
+struct Scan_Input
+{
+    T *d_scratch;
+    u32 pass_input_count;
+    Scan_PassInput<T> *pass_inputs;
+};
+
+template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
+__device__ T SegmentScanKernel(u64 count, T *array)
 {
     __shared__ T segment[2*coarse_factor*block_dim];
 
@@ -242,15 +364,15 @@ __device__ T SegmentScan_BrentKung(u64 count, T *array)
 }
 
 template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
-__global__ void Scan2_Upsweep(u64 count, T *array, T *summary)
+__global__ void ScanKernelUpsweep(u64 count, T *array, T *summary)
 {
-    T segment_result = SegmentScan_BrentKung<T, inclusive, block_dim, coarse_factor>(count, array);
+    T segment_result = SegmentScanKernel<T, inclusive, block_dim, coarse_factor>(count, array);
     if (summary && (threadIdx.x == (block_dim - 1)))
         summary[blockIdx.x] = segment_result;
 }
 
 template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
-__global__ void Scan2_Downsweep(u64 count, T *array, T *summary)
+__global__ void ScanKernelDownsweep(u64 count, T *array, T *summary)
 {
     u8 elements_per_thread = 2*coarse_factor;
 
@@ -270,6 +392,85 @@ __global__ void Scan2_Downsweep(u64 count, T *array, T *summary)
         }
     }
 }
+
+template <typename T, u32 elements_per_block>
+static Scan_Input<T> *Scan_CreateInput(Arena *arena, u64 count, T *d_array)
+{
+    Scan_Input<T> *input = PushStructZero(arena, Scan_Input<T>);
+
+    input->pass_input_count = (u32)ceilf(logf(count)/logf(elements_per_block));
+    input->pass_inputs = PushArrayZero(arena, Scan_PassInput<T>, input->pass_input_count);
+
+    // Allocate scratch
+    {
+        u64 element_count = count;
+        u64 size = 0ull;
+        for (u32 i = 0; i < input->pass_input_count - 1; ++i)
+        {
+            u64 grid_dim = (element_count + elements_per_block - 1)/elements_per_block;
+            size += grid_dim*sizeof(*input->d_scratch);
+            
+            element_count = grid_dim;
+        }
+
+        CUDACheck(cudaMalloc(&input->d_scratch, size));
+    }
+
+    u64 element_count = count;
+    u64 scratch_offset = 0;
+    for (u32 i = 0; i < input->pass_input_count; ++i)
+    {
+        Scan_PassInput<T> *pass_input = input->pass_inputs + i;
+        pass_input->d_array = d_array;
+        pass_input->d_summary = input->d_scratch + scratch_offset;
+        pass_input->element_count = element_count;
+
+        u64 grid_dim = (element_count + elements_per_block - 1)/elements_per_block;
+        scratch_offset += grid_dim;
+        
+        d_array = pass_input->d_summary;
+        element_count = grid_dim;
+    }
+
+    input->pass_inputs[input->pass_input_count - 1].d_summary = 0; // the "top" pass doesn't require a summary
+
+    return input;
+}
+
+template <typename T>
+static void Scan_DestroyInput(Scan_Input<T> *input)
+{
+    CUDACheck(cudaFree(input->d_scratch));
+}
+
+template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
+static void Scan(Scan_Input<T> *input, cudaStream_t stream)
+{
+    u32 elements_per_block = 2*coarse_factor*block_dim;
+    u32 k = input->pass_input_count;
+
+    for (u32 pass = 0; pass < k; ++pass) // k upsweeps
+    {
+        Scan_PassInput<T> *pass_input = input->pass_inputs + pass;
+
+        int grid_dim = (pass_input->element_count + elements_per_block - 1)/elements_per_block;
+        CUDACheck((ScanKernelUpsweep<T, inclusive, block_dim, coarse_factor><<<grid_dim, block_dim, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
+    }
+
+    for (s32 pass = k - 2; pass >= 0; --pass) // k - 1 downsweeps
+    {
+        Scan_PassInput<T> *pass_input = input->pass_inputs + pass;
+
+        int grid_dim = (pass_input->element_count + elements_per_block - 1)/elements_per_block;
+        CUDACheck((ScanKernelDownsweep<T, inclusive, block_dim, coarse_factor><<<grid_dim, block_dim, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
+    }
+}
+#elif SINGLE_PASS_SCAN
+enum
+{
+    g_block_dim = 512,
+    g_coarse_factor = 23,
+};
 
 // NOTE(achal): If we are concerned about memory usage we can make the flag u8 and
 // the atomic loading code slightly more complicated to handle the sizeof(Tile<T>)
@@ -343,8 +544,17 @@ __device__ void StoreTile(Tile<T> *addr, Tile<T> tile)
     }
 }
 
+template <typename T>
+struct Scan_Input
+{
+    u64 count;
+    T *d_array;
+    Tile<T> *tiles;
+    u64 *block_id_counter;
+};
+
 template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
-__global__ void Scan3Kernel(u64 count, T *array, Tile<T> *tiles, u64 *block_id_counter)
+__global__ void ScanKernel(u64 count, T *array, Tile<T> *tiles, u64 *block_id_counter)
 {
     __shared__ u64 block_id;
     if (threadIdx.x == 0)
@@ -497,71 +707,11 @@ __global__ void Scan3Kernel(u64 count, T *array, Tile<T> *tiles, u64 *block_id_c
     }
 }
 
-template <typename T>
-struct Scan_PassInput
-{
-    T *d_array;
-    T *d_summary;
-    u64 element_count;
-};
-
-template <typename T>
-struct Scan_Input
-{
-#if SEGMENTED_SCAN
-    T *d_scratch;
-    u32 pass_input_count;
-    Scan_PassInput<T> *pass_inputs;
-#else
-    u64 count;
-    T *d_array;
-    Tile<T> *tiles;
-    u64 *block_id_counter;
-#endif
-};
-
 template <typename T, u32 elements_per_block>
 static Scan_Input<T> *Scan_CreateInput(Arena *arena, u64 count, T *d_array)
 {
-    Scan_Input<T> *input = PushStruct(arena, Scan_Input<T>);
+    Scan_Input<T> *input = PushStructZero(arena, Scan_Input<T>);
 
-#if SEGMENTED_SCAN
-    input->pass_input_count = (u32)ceilf(logf(count)/logf(elements_per_block));
-    input->pass_inputs = PushArrayZero(arena, Scan_PassInput<T>, input->pass_input_count);
-
-    // Allocate scratch
-    {
-        u64 element_count = count;
-        u64 size = 0ull;
-        for (u32 i = 0; i < input->pass_input_count - 1; ++i)
-        {
-            u64 grid_dim = (element_count + elements_per_block - 1)/elements_per_block;
-            size += grid_dim*sizeof(*input->d_scratch);
-            
-            element_count = grid_dim;
-        }
-
-        CUDACheck(cudaMalloc(&input->d_scratch, size));
-    }
-
-    u64 element_count = count;
-    u64 scratch_offset = 0;
-    for (u32 i = 0; i < input->pass_input_count; ++i)
-    {
-        Scan_PassInput<T> *pass_input = input->pass_inputs + i;
-        pass_input->d_array = d_array;
-        pass_input->d_summary = input->d_scratch + scratch_offset;
-        pass_input->element_count = element_count;
-
-        u64 grid_dim = (element_count + elements_per_block - 1)/elements_per_block;
-        scratch_offset += grid_dim;
-        
-        d_array = pass_input->d_summary;
-        element_count = grid_dim;
-    }
-
-    input->pass_inputs[input->pass_input_count - 1].d_summary = 0; // the "top" pass doesn't require a summary
-#else
     input->count = count;
     input->d_array = d_array;
 
@@ -585,7 +735,6 @@ static Scan_Input<T> *Scan_CreateInput(Arena *arena, u64 count, T *d_array)
 
         ScratchEnd(&scratch);
     }
-#endif
 
     return input;
 }
@@ -593,86 +742,119 @@ static Scan_Input<T> *Scan_CreateInput(Arena *arena, u64 count, T *d_array)
 template <typename T>
 static void Scan_DestroyInput(Scan_Input<T> *input)
 {
-#if SEGMENTED_SCAN
-    CUDACheck(cudaFree(input->d_scratch));
-#else
     CUDACheck(cudaFree(input->tiles));
     CUDACheck(cudaFree(input->block_id_counter));
-#endif
 }
 
 template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
-static void Scan1(Scan_Input<T> *input, cudaStream_t stream)
-{
-    u32 elements_per_block = coarse_factor*block_dim;
-    u32 k = input->pass_input_count;
-
-    for (u32 pass = 0; pass < k; ++pass) // k upsweeps
-    {
-        Scan_PassInput<T> *pass_input = input->pass_inputs + pass;
-
-        int grid_dim = (pass_input->element_count + elements_per_block - 1)/elements_per_block;
-        CUDACheck((Scan1_Upsweep<T, inclusive, block_dim, coarse_factor><<<grid_dim, block_dim, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
-    }
-
-    for (s32 pass = k - 2; pass >= 0; --pass) // k - 1 downsweeps
-    {
-        Scan_PassInput<T> *pass_input = input->pass_inputs + pass;
-
-        int grid_dim = (pass_input->element_count + elements_per_block - 1)/elements_per_block;
-        CUDACheck((Scan1_Downsweep<T, inclusive, block_dim, coarse_factor><<<grid_dim, block_dim, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
-    }
-}
-
-template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
-static void Scan2(Scan_Input<T> *input, cudaStream_t stream)
-{
-    u32 elements_per_block = 2*coarse_factor*block_dim;
-    u32 k = input->pass_input_count;
-
-    for (u32 pass = 0; pass < k; ++pass) // k upsweeps
-    {
-        Scan_PassInput<T> *pass_input = input->pass_inputs + pass;
-
-        int grid_dim = (pass_input->element_count + elements_per_block - 1)/elements_per_block;
-        CUDACheck((Scan2_Upsweep<T, inclusive, block_dim, coarse_factor><<<grid_dim, block_dim, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
-    }
-
-    for (s32 pass = k - 2; pass >= 0; --pass) // k - 1 downsweeps
-    {
-        Scan_PassInput<T> *pass_input = input->pass_inputs + pass;
-
-        int grid_dim = (pass_input->element_count + elements_per_block - 1)/elements_per_block;
-        CUDACheck((Scan2_Downsweep<T, inclusive, block_dim, coarse_factor><<<grid_dim, block_dim, 0, stream>>>(pass_input->element_count, pass_input->d_array, pass_input->d_summary)));
-    }
-}
-
-template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
-static void Scan3(Scan_Input<T> *input, cudaStream_t stream)
+static void Scan(Scan_Input<T> *input, cudaStream_t stream)
 {
     u32 elements_per_block = coarse_factor*block_dim;
     u64 grid_dim = (input->count + elements_per_block - 1)/elements_per_block;
-    CUDACheck((Scan3Kernel<T, inclusive, block_dim, coarse_factor><<<grid_dim, block_dim, 0, stream>>>(input->count, input->d_array, input->tiles, input->block_id_counter)));
+    CUDACheck((ScanKernel<T, inclusive, block_dim, coarse_factor><<<grid_dim, block_dim, 0, stream>>>(input->count, input->d_array, input->tiles, input->block_id_counter)));
 }
+#elif CUB_SCAN
+#include <cub/device/device_scan.cuh>
+
+// NOTE(achal): CUB should just ignore this.
+enum
+{
+    g_block_dim = 512,
+    g_coarse_factor = 5,
+};
+
+template <typename T>
+struct Scan_Input
+{
+    u64 count;
+    T *d_array;
+    void *d_temp_storage;
+    size_t temp_storage_bytes;
+};
+
+template <typename T, u32 elements_per_block>
+static Scan_Input<T> *Scan_CreateInput(Arena *arena, u64 count, T *d_array)
+{
+    Scan_Input<T> *input = PushStructZero(arena, Scan_Input<T>);
+
+    input->count = count;
+    input->d_array = d_array;
+    // NOTE(achal): I am assuming that the storage requirements are the same for inclusive and exclusive scans!
+    cub::DeviceScan::InclusiveSum(input->d_temp_storage, input->temp_storage_bytes, input->d_array, input->count);
+    CUDACheck(cudaMalloc(&input->d_temp_storage, input->temp_storage_bytes));
+
+    return input;
+}
+
+template <typename T>
+static void Scan_DestroyInput(Scan_Input<T> *input)
+{
+    CUDACheck(cudaFree(input->d_temp_storage));
+}
+
+template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
+void Scan(Scan_Input<T> *input, cudaStream_t stream)
+{
+    if constexpr (inclusive)
+    {
+        cub::DeviceScan::InclusiveSum(input->d_temp_storage, input->temp_storage_bytes, input->d_array, input->count, stream);
+    }
+    else
+    {
+        cub::DeviceScan::ExclusiveSum(input->d_temp_storage, input->temp_storage_bytes, input->d_array, input->count, stream);
+    }
+}
+#elif THRUST_SCAN
+#include <thrust/scan.h>
+
+// NOTE(achal): Thrust should just ignore this.
+enum
+{
+    g_block_dim = 512,
+    g_coarse_factor = 5,
+};
+
+template <typename T>
+struct Scan_Input
+{
+    u64 count;
+    T *d_array;
+};
+
+template <typename T, u32 elements_per_block>
+static Scan_Input<T> *Scan_CreateInput(Arena *arena, u64 count, T *d_array)
+{
+    Scan_Input<T> *input = PushStructZero(arena, Scan_Input<T>);
+
+    input->count = count;
+    input->d_array = d_array;
+
+    return input;
+}
+
+template <typename T>
+static void Scan_DestroyInput(Scan_Input<T> *input)
+{
+}
+
+template <typename T, bool inclusive, u32 block_dim, u32 coarse_factor>
+void Scan(Scan_Input<T> *input, cudaStream_t stream)
+{
+    if constexpr (inclusive)
+    {
+        thrust::inclusive_scan(thrust::cuda::par.on(stream), input->d_array, input->d_array + input->count, input->d_array);
+    }
+    else
+    {
+        thrust::exclusive_scan(thrust::cuda::par.on(stream), input->d_array, input->d_array + input->count, input->d_array);
+    }
+}
+#else
+#error "No scan algorithm selected"
+#endif
 
 #include "benchmarking.cu"
 using InputType = int;
-
-#if BENCHMARK_THRUST
-#include <thrust/scan.h>
-
-template <typename T>
-void ThrustInclusiveScan(u64 count, T *input, T *output, cudaStream_t stream)
-{
-    thrust::inclusive_scan(thrust::cuda::par.on(stream), input, input + count, output);
-}
-
-template <typename T>
-void ThrustExclusiveScan(u64 count, T *input, T *output, cudaStream_t stream)
-{
-    thrust::exclusive_scan(thrust::cuda::par.on(stream), input, input + count, output);
-}
-#endif
 
 template <typename T>
 struct Data
@@ -688,10 +870,11 @@ struct Data
 template <typename T, u32 elements_per_block>
 static Data<T> *CreateData(Arena *arena, u64 count, cudaStream_t stream)
 {
-    Data<T> *data = PushStruct(arena, Data<T>);
+    Data<T> *data = PushStructZero(arena, Data<T>);
+
     data->count = count;
 
-    data->h_array = PushArray(arena, T, data->count);
+    data->h_array = PushArrayZero(arena, T, data->count);
     for (u64 i = 0; i < data->count; ++i)
         data->h_array[i] = T(1);
 
@@ -732,27 +915,11 @@ static b32 ValidateGPUOutput(Arena *arena, Data<T> *data)
 template <typename T, u32 block_dim, u32 coarse_factor>
 static void FunctionToBenchmark(Data<T> *data, cudaStream_t stream)
 {
-#if BENCHMARK_THRUST
-    ThrustInclusiveScan<T>(data->count, data->d_array, data->d_array, stream);
-#else
-#if SEGMENTED_SCAN
-    Scan1<T, true, block_dim, coarse_factor>(data->input, stream);
-    // Scan2<T, true, block_dim, coarse_factor>(data->input, stream);
-#else
-    Scan3<T, true, block_dim, coarse_factor>(data->input, stream);
-#endif
-#endif
+    Scan<T, true, block_dim, coarse_factor>(data->input, stream);
 }
 
-enum Test_ScanAlgorithm
-{
-    Test_ScanAlgorithm_1 = 0, // Kogge-Stone
-    Test_ScanAlgorithm_2, // Brent-Kung
-    Test_ScanAlgorithm_Count,
-};
-
 template <u32 block_dim, u32 coarse_factor>
-static void Test_Scan(Test_ScanAlgorithm algorithm);
+static void Test_Scan();
 
 static void Test_ScanSuite();
 
@@ -771,7 +938,7 @@ int main(int argc, char **argv)
     if (0)
     {
         // Test_ScanSuite();
-        Test_Scan<512, 5>((Test_ScanAlgorithm)Test_ScanAlgorithm_1);
+        Test_Scan<512, 5>();
         printf("All tests passed\n");
     }
     
@@ -781,41 +948,21 @@ int main(int argc, char **argv)
 
     if (file_name)
     {
-        enum { block_dim = 512, coarse_factor = 23 };
-        Benchmark<InputType, block_dim, coarse_factor>(peak_gbps, peak_gflops, file_name);
+        Benchmark<InputType, g_block_dim, g_coarse_factor>(peak_gbps, peak_gflops, file_name);
     }
 
     return 0;
 }
 
 template <bool inclusive, u32 block_dim, u32 coarse_factor>
-static void Test_Scan_(Test_ScanAlgorithm algorithm, u64 count)
+static void Test_Scan_(u64 count)
 {
     using DataType = int;
 
-    Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
-            
+    Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));            
     Data<DataType> *data = CreateData<DataType, block_dim*coarse_factor>(scratch.arena, count, 0);
 
-    switch (algorithm)
-    {
-#if SEGMENTED_SCAN
-        case Test_ScanAlgorithm_1:
-            Scan1<DataType, inclusive, block_dim, coarse_factor>(data->input, 0);
-            break;
-        case Test_ScanAlgorithm_2:
-            Scan2<DataType, inclusive, block_dim, coarse_factor>(data->input, 0);
-            break;
-        default:
-            Assert(0);
-#else
-        case Test_ScanAlgorithm_1:
-            Scan3<DataType, inclusive, block_dim, coarse_factor>(data->input, 0);
-            break;
-        default:
-            Assert(0);
-#endif
-    }
+    Scan<DataType, inclusive, block_dim, coarse_factor>(data->input, 0);
 
     DataType *gpu_output = PushArray(scratch.arena, DataType, count);
     CUDACheck(cudaMemcpy(gpu_output, data->d_array, count*sizeof(DataType), cudaMemcpyDeviceToHost));
@@ -843,9 +990,9 @@ static void Test_Scan_(Test_ScanAlgorithm algorithm, u64 count)
 }
 
 template <u32 block_dim, u32 coarse_factor>
-static void Test_Scan(Test_ScanAlgorithm algorithm)
+static void Test_Scan()
 {
-    printf("Algorithm: %d, Block dim: %d, Coarse factor: %d\n", algorithm, block_dim, coarse_factor);
+    printf("Block dim: %d, Coarse factor: %d\n", block_dim, coarse_factor);
 
     srand(0);
     int test_count = 10;
@@ -856,11 +1003,11 @@ static void Test_Scan(Test_ScanAlgorithm algorithm)
         printf("\tCount: %llu:\t", count);
 
         printf("Inclusive, ");
-        Test_Scan_<true, block_dim, coarse_factor>(algorithm, count);
+        Test_Scan_<true, block_dim, coarse_factor>(count);
         printf("Passed, ");
 
         printf("Exclusive, ");
-        Test_Scan_<false, block_dim, coarse_factor>(algorithm, count);
+        Test_Scan_<false, block_dim, coarse_factor>(count);
         printf("Passed\n");
     }
 }
@@ -868,19 +1015,13 @@ static void Test_Scan(Test_ScanAlgorithm algorithm)
 static void Test_ScanSuite()
 {
     enum { block_dim = 512, };
-#if SEGMENTED_SCAN
-    for (int algorithm = 0; algorithm < Test_ScanAlgorithm_Count; ++algorithm)
-#else
-    for (int algorithm = 0; algorithm < 1; ++algorithm)
-#endif
-    {
-        Test_Scan<block_dim, 1>((Test_ScanAlgorithm)algorithm);
-        Test_Scan<block_dim, 2>((Test_ScanAlgorithm)algorithm);
-        Test_Scan<block_dim, 3>((Test_ScanAlgorithm)algorithm);
-        Test_Scan<block_dim, 4>((Test_ScanAlgorithm)algorithm);
-        Test_Scan<block_dim, 5>((Test_ScanAlgorithm)algorithm);
-        Test_Scan<block_dim, 6>((Test_ScanAlgorithm)algorithm);
-        Test_Scan<block_dim, 7>((Test_ScanAlgorithm)algorithm);
-        Test_Scan<block_dim, 8>((Test_ScanAlgorithm)algorithm);
-    }
+
+    Test_Scan<block_dim, 1>();
+    Test_Scan<block_dim, 2>();
+    Test_Scan<block_dim, 3>();
+    Test_Scan<block_dim, 4>();
+    Test_Scan<block_dim, 5>();
+    Test_Scan<block_dim, 6>();
+    Test_Scan<block_dim, 7>();
+    Test_Scan<block_dim, 8>();
 }

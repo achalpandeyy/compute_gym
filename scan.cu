@@ -271,20 +271,27 @@ __global__ void Scan2_Downsweep(u64 count, T *array, T *summary)
     }
 }
 
+// NOTE(achal): If we are concerned about memory usage we can make the flag u8 and
+// the atomic loading code slightly more complicated to handle the sizeof(Tile<T>)
+// equals 4 case.
+enum TileStatus : u32
+{
+    TileStatus_Invalid = 0,
+    TileStatus_Partial,
+    TileStatus_Inclusive,
+};
+
 template <typename T>
 struct Tile
-{    
-    // NOTE(achal): If we are concerned about memory usage we can make the flag u8 and
-    // the atomic loading code slightly more complicated to handle the sizeof(Tile<T>)
-    // equals 4 case.
-    u32 flag;
+{
+    TileStatus status;
     T value;
 };
 
 template <typename T>
 __device__ Tile<T> LoadTile(Tile<T> *addr)
 {
-    Tile<T> tile = {0, 0};
+    Tile<T> tile;
     if constexpr (sizeof(tile) == 16)
     {
         u64 tile_data[2];
@@ -293,13 +300,13 @@ __device__ Tile<T> LoadTile(Tile<T> *addr)
         tile_data[1] = atomicAdd((u64 *)addr + 1, 0);
 
         // flag | pad | value
-        tile.flag = (u32)(tile_data[0] & 0xFFFFFFFF);
+        tile.status = (TileStatus)(tile_data[0] & 0xFFFFFFFF);
         tile.value = *reinterpret_cast<T *>(&tile_data[1]);
     }
     else if constexpr (sizeof(tile) == 8)
     {
         u64 tile_data = atomicAdd((u64 *)addr, 0);
-        tile.flag = (u32)(tile_data & 0xFFFFFFFF);
+        tile.status = (TileStatus)(tile_data & 0xFFFFFFFF);
         
         u32 tile_value_u32 = (u32)((tile_data >> 32) & 0xFFFFFFFF);
         tile.value = *reinterpret_cast<T *>(&tile_value_u32);
@@ -318,17 +325,17 @@ __device__ void StoreTile(Tile<T> *addr, Tile<T> tile)
     {
         u64 tile_data[2];
         tile_data[1] = *reinterpret_cast<u64 *>(&tile.value);
-        tile_data[0] = tile_data[0] | tile.flag;
+        tile_data[0] = tile_data[0] | tile.status;
 
-        atomicAdd((u64 *)addr + 1, tile_data[1]);
+        atomicExch((u64 *)addr + 1, tile_data[1]);
         __threadfence();
-        atomicAdd((u64 *)addr, tile_data[0]);
+        atomicExch((u64 *)addr, tile_data[0]);
     }
     else if constexpr (sizeof(tile) == 8)
     {
         u32 tile_value_u32 = *reinterpret_cast<u32 *>(&tile.value);
-        u64 packed = ((u64)tile_value_u32 << 32) | tile.flag;
-        atomicAdd((u64 *)addr, packed);
+        u64 packed = ((u64)tile_value_u32 << 32) | tile.status;
+        atomicExch((u64 *)addr, packed);
     }
     else
     {
@@ -416,18 +423,68 @@ __global__ void Scan3Kernel(u64 count, T *array, Tile<T> *tiles, u64 *block_id_c
         segment_result = segment_result_shared;
     }
 
-    __shared__ T prev_block_sums;
-    if (threadIdx.x == 0)
+    __shared__ T exclusive_prefix;
+    if (block_id == 0)
     {
-        Tile<T> src_tile = LoadTile(&tiles[block_id]);
-        while (src_tile.flag == 0)
+        if (threadIdx.x == 0)
         {
-            src_tile = LoadTile(&tiles[block_id]);
+            Tile<T> tile;
+            tile.status = TileStatus_Inclusive;
+            tile.value = segment_result;
+            StoreTile(&tiles[block_id], tile);
         }
-        
-        prev_block_sums = src_tile.value;
-        Tile<T> dst_tile = {1, prev_block_sums + segment_result};
-        StoreTile(&tiles[block_id + 1], dst_tile);
+
+        exclusive_prefix = 0;
+    }
+    else
+    {   
+        if (threadIdx.x == 0)
+        {
+            {
+                Tile<T> tile;
+                tile.status = TileStatus_Partial;
+                tile.value = segment_result;
+                StoreTile(&tiles[block_id], tile);
+            }
+
+            exclusive_prefix = 0;
+
+            // Check on the predecessor(s)
+            int predecessor_index = block_id - 1;
+            while (predecessor_index >= 0)
+            {
+                // Wait until the predecessor tile becomes valid i.e. not TileStatus_Invalid
+                Tile<T> predecessor_tile = LoadTile(&tiles[predecessor_index]);
+                while (predecessor_tile.status == TileStatus_Invalid)
+                {
+                    predecessor_tile = LoadTile(&tiles[predecessor_index]);
+                }
+
+                if (predecessor_tile.status == TileStatus_Inclusive) // early termination of lookback
+                {
+                    exclusive_prefix += predecessor_tile.value;
+                    break;
+                }
+                else if (predecessor_tile.status == TileStatus_Partial)
+                {
+                    exclusive_prefix += predecessor_tile.value;
+                }
+                else
+                {
+                    printf("Invalid tile status: %d\n", predecessor_tile.status);
+                    Assert(0); // invalid code path
+                }
+
+                predecessor_index--;
+            }
+
+            {
+                Tile<T> tile;
+                tile.status = TileStatus_Inclusive;
+                tile.value = exclusive_prefix + segment_result;
+                StoreTile(&tiles[block_id], tile);
+            }
+        }
     }
     __syncthreads();
 
@@ -436,7 +493,7 @@ __global__ void Scan3Kernel(u64 count, T *array, Tile<T> *tiles, u64 *block_id_c
         int smem_index = i*block_dim + threadIdx.x;
         int gmem_index = block_id*coarse_factor*block_dim + smem_index;
         if (gmem_index < count)
-            array[gmem_index] = prev_block_sums + segment[smem_index];
+            array[gmem_index] = exclusive_prefix + segment[smem_index];
     }
 }
 
@@ -518,7 +575,6 @@ static Scan_Input<T> *Scan_CreateInput(Arena *arena, u64 count, T *d_array)
         u64 grid_dim = (count + elements_per_block - 1)/elements_per_block;
         
         Tile<T> *tiles = PushArrayZero(scratch.arena, Tile<T>, grid_dim);
-        tiles[0].flag = 1;
 
         CUDACheck(cudaMalloc(&input->tiles, grid_dim*sizeof(*input->tiles)));
         CUDACheck(cudaMemcpy(input->tiles, tiles, grid_dim*sizeof(*input->tiles), cudaMemcpyHostToDevice));

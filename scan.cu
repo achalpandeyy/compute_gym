@@ -3,8 +3,8 @@
 
 #include "common.cuh"
 
-#define SEGMENTED_KOGGE_STONE_SCAN 0
-#define SEGMENTED_BRENT_KUNG_SCAN 1
+#define SEGMENTED_KOGGE_STONE_SCAN 1
+#define SEGMENTED_BRENT_KUNG_SCAN 0
 #define SINGLE_PASS_SCAN 0
 #define CUB_SCAN 0
 #define THRUST_SCAN 0
@@ -660,8 +660,7 @@ __global__ void ScanKernel(u64 count, T *array, Tile<T> *tiles, u64 *block_id_co
             exclusive_prefix = 0;
 
             // Check on the predecessor(s)
-            int predecessor_index = block_id - 1;
-            while (predecessor_index >= 0)
+            for (int predecessor_index = block_id - 1; predecessor_index >= 0; --predecessor_index)
             {
                 // Wait until the predecessor tile becomes valid i.e. not TileStatus_Invalid
                 Tile<T> predecessor_tile = LoadTile(&tiles[predecessor_index]);
@@ -684,8 +683,6 @@ __global__ void ScanKernel(u64 count, T *array, Tile<T> *tiles, u64 *block_id_co
                     printf("Invalid tile status: %d\n", predecessor_tile.status);
                     Assert(0); // invalid code path
                 }
-
-                predecessor_index--;
             }
 
             {
@@ -937,8 +934,8 @@ int main(int argc, char **argv)
 
     if (0)
     {
-        // Test_ScanSuite();
-        Test_Scan<512, 5>();
+        Test_ScanSuite();
+        // Test_Scan<512, 5>();
         printf("All tests passed\n");
     }
     

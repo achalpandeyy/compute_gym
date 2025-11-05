@@ -4,3 +4,4 @@ build/
 
 *.nsys-rep
 *.sqlite
+*.png

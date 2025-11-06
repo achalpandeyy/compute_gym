@@ -1,5 +1,7 @@
 #include "core_types.h"
 #include "core_memory.h"
+#include "core.h"
+
 #include "common.cuh"
 
 template <typename T, u32 block_dim, u32 coarse_factor>
@@ -38,20 +40,6 @@ void Reduce(u64 count, T *input, T *output, cudaStream_t stream)
     CUDACheck((ReduceKernel<T, block_dim, coarse_factor><<<grid_dim, block_dim, 0, stream>>>(count, input, output)));
 }
 
-#if COMPILING_FROM_PYTORCH
-#include <c10/cuda/CUDAStream.h>
-
-void Reduce(torch::Tensor input, torch::Tensor output)
-{
-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    int array_count = input.numel();
-    f32 *d_input = input.data_ptr<f32>();
-    f32 *d_output = output.data_ptr<f32>();
-
-    Reduce(array_count, d_input, d_output, stream);
-}
-#else
-
 #include "benchmarking.cu"
 
 using InputType = f32;
@@ -67,6 +55,19 @@ void ThrustReduce(u64 count, T *input, T *output, cudaStream_t stream)
 #endif
 
 template <typename T>
+struct DataDescriptor
+{
+    DataDescriptor *next;
+    u64 count;
+};
+
+template <typename T>
+static u64 GetDataTransferSize(DataDescriptor<T> *descriptor)
+{
+    return descriptor->count*sizeof(T);
+}
+
+template <typename T>
 struct Data
 {
     u64 count;
@@ -76,10 +77,10 @@ struct Data
 };
 
 template <typename T, u32 elements_per_block>
-static Data<T> *CreateData(Arena *arena, u64 count, cudaStream_t stream)
+static Data<T> *CreateData(Arena *arena, DataDescriptor<T> *descriptor, cudaStream_t stream)
 {
     Data<T> *data = PushStruct(arena, Data<T>);
-    data->count = count;
+    data->count = descriptor->count;
 
     data->h_in = PushArray(arena, T, data->count);
     for (u64 i = 0; i < data->count; ++i)
@@ -148,8 +149,17 @@ int main(int argc, char **argv)
 
     if (file_name)
     {
+        Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(8)));
+        DataDescriptorList<InputType> *benching_data = PushStructZero(scratch.arena, DataDescriptorList<InputType>);
+        for (u32 exp = 1; exp <= 28; ++exp)
+        {
+            DataDescriptor<InputType> *desc = PushStructZero(scratch.arena, DataDescriptor<InputType>);
+            desc->count = 1 << exp;
+            ListPush(benching_data->first, benching_data->last, next, desc);
+        }
         enum { block_dim = 512, coarse_factor = 4 };
-        Benchmark<InputType, block_dim, coarse_factor>(peak_gbps, peak_gflops, file_name);
+        Benchmark<InputType, block_dim, coarse_factor>(benching_data, peak_gbps, peak_gflops, file_name);
+        ScratchEnd(&scratch);
     }
 
     return 0;
@@ -169,7 +179,9 @@ static void Test_Reduce()
         u64 count = GetRandomNumber(30);
         printf("Count: %llu", count);
 
-        Data<int> *data = CreateData<int, block_dim*coarse_factor>(scratch.arena, count, 0);
+        DataDescriptor<int> *desc = PushStructZero(scratch.arena, DataDescriptor<int>);
+        desc->count = count;
+        Data<int> *data = CreateData<int, block_dim*coarse_factor>(scratch.arena, desc, 0);
         Reduce<int, block_dim, coarse_factor>(count, data->d_in, data->d_out, 0);
 
         if (!ValidateGPUOutput<int>(scratch.arena, data))
@@ -185,4 +197,3 @@ static void Test_Reduce()
         --test_count;
     }
 }
-#endif

@@ -1,8 +1,19 @@
 template <typename T>
+struct DataDescriptor;
+
+template <typename T>
+struct DataDescriptorList
+{
+    DataDescriptor<T> *first;
+    DataDescriptor<T> *last;
+    u32 count;
+};
+
+template <typename T>
 struct Data;
 
 template <typename T, u32 elements_per_block>
-static Data<T> *CreateData(Arena *arena, u64 count, cudaStream_t stream);
+static Data<T> *CreateData(Arena *arena, DataDescriptor<T> *descriptor, cudaStream_t stream);
 
 template <typename T>
 static void DestroyData(Data<T> *data);
@@ -36,7 +47,7 @@ static void FlushL2Cache()
 // NOTE(achal): Inspired by:
 // https://github.com/gpu-mode/reference-kernels/blob/750868c61cd81fdcec8826a0cfcf4cb7fea064da/problems/pmpp_v2/eval.py#L237
 template <typename T, u32 block_dim, u32 coarse_factor>
-void Benchmark(f64 peak_gbps, f64 peak_gflops, const char *file_name)
+void Benchmark(DataDescriptorList<T> *benching_data, f64 peak_gbps, f64 peak_gflops, const char *file_name)
 {
 #if BUILD_DEBUG
     printf("Warning: Benchmarking in debug mode. Results will be inaccurate.\n");
@@ -58,29 +69,27 @@ void Benchmark(f64 peak_gbps, f64 peak_gflops, const char *file_name)
     {
         Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
 
-        Data<T> *data = CreateData<T, block_dim*coarse_factor>(scratch.arena, 1 << 18, 0);
+        Data<T> *data = CreateData<T, block_dim*coarse_factor>(scratch.arena, benching_data->first, 0);
         FunctionToBenchmark<T, block_dim, coarse_factor>(data, 0);
         DestroyData<T>(data);
         
         ScratchEnd(&scratch);
     }
 
-    for (u32 exp = 1; exp <= 28; ++exp)
+    for (DataDescriptor<T> *desc = benching_data->first; desc; desc = desc->next)
     {
-        u64 array_count = 1 << exp;
-
         // Correctness check
         b32 correct = 1;
         {
             Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
-            Data<T> *data = CreateData<T, block_dim*coarse_factor>(scratch.arena, array_count, 0);
+            Data<T> *data = CreateData<T, block_dim*coarse_factor>(scratch.arena, desc, 0);
 
             FunctionToBenchmark<T, block_dim, coarse_factor>(data, 0);
 
             if (!ValidateGPUOutput<T>(scratch.arena, data))
             {
                 // assert(0);
-                printf("Failed for %llu elements, skipping benchmark\n", array_count);
+                printf("Failed, skipping benchmark\n");
                 correct = 0;
             }
 
@@ -104,7 +113,7 @@ void Benchmark(f64 peak_gbps, f64 peak_gflops, const char *file_name)
             int max_reps = 20;
             int max_benchmarking_ms = 120*1000;
             
-            f64 *duration_ms = PushArray(scratch.arena, f64, max_reps);
+            f64 *duration_ms = PushArrayZero(scratch.arena, f64, max_reps);
             f64 ms_mean = 0.0;
 
             int rep = 0;
@@ -112,7 +121,7 @@ void Benchmark(f64 peak_gbps, f64 peak_gflops, const char *file_name)
             {
                 {
                     Scratch data_scratch = ScratchBegin(scratch.arena);
-                    Data<T> *data = CreateData<T, block_dim*coarse_factor>(data_scratch.arena, array_count, stream);
+                    Data<T> *data = CreateData<T, block_dim*coarse_factor>(data_scratch.arena, desc, stream);
                     
                     FlushL2Cache();
                     CUDACheck(cudaEventRecord(start_event, stream));
@@ -152,16 +161,16 @@ void Benchmark(f64 peak_gbps, f64 peak_gflops, const char *file_name)
                 }
             }
 
-            f64 bandwidth = (1000.0*(array_count*sizeof(T)))/(ms_mean*1024.0*1024.0*1024.0);
+            f64 bandwidth = (1000.0*GetDataTransferSize(desc))/(ms_mean*1024.0*1024.0*1024.0);
 
             if (file)
             {
-                fwrite(&array_count, sizeof(u64), 1, file);
+                // fwrite(&array_count, sizeof(u64), 1, file);
                 fwrite(&ms_mean, sizeof(f64), 1, file);
                 fwrite(&bandwidth, sizeof(f64), 1, file);
             }
 
-            printf("Array count: %llu\n", array_count);
+            // printf("Array count: %llu\n", array_count);
             printf("Elapsed (GPU): %f ms [%d]\n", ms_mean, rep);
             printf("Bandwidth: %f GB/s\n", bandwidth);
 
@@ -170,7 +179,7 @@ void Benchmark(f64 peak_gbps, f64 peak_gflops, const char *file_name)
             CUDACheck(cudaStreamDestroy(stream));
 
             ScratchEnd(&scratch);
-        }          
+        }
     }
 
     fclose(file);

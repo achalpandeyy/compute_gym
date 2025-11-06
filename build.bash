@@ -39,6 +39,7 @@ ctime="../../../tools/ctime/ctime.exe"
 
 if [ -v reduce ];     then $ctime -begin .reduce.ctm;     eval "$compile ../reduce.cu    $out reduce";     $ctime -end .reduce.ctm $?;     fi
 if [ -v scan ];       then $ctime -begin .scan.ctm;       eval "$compile ../scan.cu      $out scan";       $ctime -end .scan.ctm $?;       fi
+if [ -v matmul ];     then $ctime -begin .matmul.ctm;     eval "$compile ../matmul.cu    $out matmul";     $ctime -end .matmul.ctm $?;     fi
 
 # NOTE(achal): STREAM benchmark to measure peak sustained bandwidth.
 if [ -v CUDAStream ]; then $ctime -begin .CUDAStream.ctm; eval "$compile ../ext/BabelStream/main.cu      $out CUDAStream"; $ctime -end .CUDAStream.ctm $?; fi

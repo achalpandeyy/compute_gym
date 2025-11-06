@@ -1,11 +1,14 @@
 #include "core_types.h"
 #include "core_memory.h"
+#include "core.h"
 
 #include "common.cuh"
 
-#define SEGMENTED_KOGGE_STONE_SCAN 1
+#include "benchmarking.cu"
+
+#define SEGMENTED_KOGGE_STONE_SCAN 0
 #define SEGMENTED_BRENT_KUNG_SCAN 0
-#define SINGLE_PASS_SCAN 0
+#define SINGLE_PASS_SCAN 1
 #define CUB_SCAN 0
 #define THRUST_SCAN 0
 
@@ -850,8 +853,14 @@ void Scan(Scan_Input<T> *input, cudaStream_t stream)
 #error "No scan algorithm selected"
 #endif
 
-#include "benchmarking.cu"
 using InputType = int;
+
+template <typename T>
+struct DataDescriptor
+{
+    DataDescriptor *next;
+    u64 count;
+};
 
 template <typename T>
 struct Data
@@ -862,14 +871,18 @@ struct Data
     Scan_Input<T> *input;
 };
 
-// StaticAssert(IsPoT(g_block_dim));
+template <typename T>
+static u64 GetDataTransferSize(DataDescriptor<T> *descriptor)
+{
+    return descriptor->count*sizeof(T);
+}
 
 template <typename T, u32 elements_per_block>
-static Data<T> *CreateData(Arena *arena, u64 count, cudaStream_t stream)
+static Data<T> *CreateData(Arena *arena, DataDescriptor<T> *descriptor, cudaStream_t stream)
 {
     Data<T> *data = PushStructZero(arena, Data<T>);
 
-    data->count = count;
+    data->count = descriptor->count;
 
     data->h_array = PushArrayZero(arena, T, data->count);
     for (u64 i = 0; i < data->count; ++i)
@@ -945,7 +958,18 @@ int main(int argc, char **argv)
 
     if (file_name)
     {
-        Benchmark<InputType, g_block_dim, g_coarse_factor>(peak_gbps, peak_gflops, file_name);
+        Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(8)));
+
+        DataDescriptorList<InputType> *benching_data = PushStructZero(scratch.arena, DataDescriptorList<InputType>);
+        for (u32 exp = 1; exp <= 28; ++exp)
+        {
+            DataDescriptor<InputType> *desc = PushStructZero(scratch.arena, DataDescriptor<InputType>);
+            desc->count = 1 << exp;
+            ListPush(benching_data->first, benching_data->last, next, desc);
+        }
+        Benchmark<InputType, g_block_dim, g_coarse_factor>(benching_data, peak_gbps, peak_gflops, file_name);
+
+        ScratchEnd(&scratch);
     }
 
     return 0;
@@ -957,7 +981,9 @@ static void Test_Scan_(u64 count)
     using DataType = int;
 
     Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));            
-    Data<DataType> *data = CreateData<DataType, block_dim*coarse_factor>(scratch.arena, count, 0);
+    DataDescriptor<DataType> *desc = PushStructZero(scratch.arena, DataDescriptor<DataType>);
+    desc->count = count;
+    Data<DataType> *data = CreateData<DataType, block_dim*coarse_factor>(scratch.arena, desc, 0);
 
     Scan<DataType, inclusive, block_dim, coarse_factor>(data->input, 0);
 

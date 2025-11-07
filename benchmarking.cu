@@ -12,6 +12,12 @@ struct DataDescriptorList
 template <typename T>
 struct Data;
 
+template <typename T>
+static u64 GetDataTransferSize(DataDescriptor<T> *descriptor);
+
+template <typename T>
+static u64 GetFLOPS(DataDescriptor<T> *descriptor);
+
 template <typename T, u32 elements_per_block>
 static Data<T> *CreateData(Arena *arena, DataDescriptor<T> *descriptor, cudaStream_t stream);
 
@@ -162,6 +168,7 @@ void Benchmark(DataDescriptorList<T> *benching_data, f64 peak_gbps, f64 peak_gfl
             }
 
             f64 bandwidth = (1000.0*GetDataTransferSize(desc))/(ms_mean*1024.0*1024.0*1024.0);
+            f64 gflops = (1000.0*GetFLOPS(desc))/(ms_mean*1024.0*1024.0*1024.0);
 
             if (file)
             {
@@ -173,6 +180,7 @@ void Benchmark(DataDescriptorList<T> *benching_data, f64 peak_gbps, f64 peak_gfl
             // printf("Array count: %llu\n", array_count);
             printf("Elapsed (GPU): %f ms [%d]\n", ms_mean, rep);
             printf("Bandwidth: %f GB/s\n", bandwidth);
+            printf("Throughput: %f GFLOPS\n", gflops);
 
             CUDACheck(cudaEventDestroy(stop_event));
             CUDACheck(cudaEventDestroy(start_event));

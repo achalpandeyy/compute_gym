@@ -2,120 +2,81 @@ import math
 import struct
 import sys
 import matplotlib.pyplot as plt
+import numpy as np
+from dataclasses import dataclass
 
-class BenchmarkData:
-    def __init__(
-        self,
-        file_name: str,
-        peak_gbps: float | None,
-        peak_gflops: float | None,
-        element_counts: list[int],
-        ms_values: list[float],
-        bandwidth_values: list[float]):
-        self.file_name = file_name
-        self.peak_gbps = peak_gbps
-        self.peak_gflops = peak_gflops
-        self.element_counts = element_counts
-        self.ms_values = ms_values
-        self.bandwidth_values = bandwidth_values
+@dataclass
+class BenchmarkResult:
+    labels: tuple[str]
+    gbps_values: tuple[float]
+    gflops_values: tuple[float]
+    ms_values: tuple[float]
 
-    file_name: str
-    peak_gbps: float | None
-    peak_gflops: float | None
-    element_counts: list[int]
-    ms_values: list[float]
-    bandwidth_values: list[float]
-
-def load_benchmark_data(file_name: str) -> BenchmarkData:
-    element_counts = []
-    ms_values = []
-    bandwidth_values = []
-    with open(file_name, "rb") as file:
-        peak_gbps = None
-        peak_gflops = None
-        metadata_present = struct.unpack("b", file.read(1))[0]
-        if metadata_present:
-            peak_gbps = struct.unpack("d", file.read(8))[0]
-            peak_gflops = struct.unpack("d", file.read(8))[0]
-
-        record_format = "Qdd"
-        record_size = struct.calcsize(record_format)
-
+def load_benchmark_result(path: str):
+    labels = []
+    gbps_values = []
+    gflops_values = []
+    ms_values = [] 
+    with open(path, "rb") as f:
         while True:
-            chunk = file.read(record_size)
-            if not chunk:
+            data = f.read(4)
+            if not data:
                 break
-            element_counts.append(struct.unpack(record_format, chunk)[0])
-            ms_values.append(struct.unpack(record_format, chunk)[1])
-            bandwidth_values.append(struct.unpack(record_format, chunk)[2])
 
-    assert len(element_counts) == len(ms_values) == len(bandwidth_values)
-    return BenchmarkData(file_name, peak_gbps, peak_gflops, element_counts, ms_values, bandwidth_values)
+            label_length = struct.unpack("<I", data)[0]
+            label = f.read(label_length).decode("utf-8")
+            labels.append(label)
 
-if len(sys.argv) <= 1:
-    print("Usage: python plot_bench.py benchmark file(s)...")
-    sys.exit(1)
+            gbps, gflops, ms = struct.unpack("<ddd", f.read(24))
+            gbps_values.append(gbps)
+            gflops_values.append(gflops)
+            ms_values.append(ms)
+    
+    return BenchmarkResult(tuple(labels), tuple(gbps_values), tuple(gflops_values), tuple(ms_values))
 
-benchmark_files = sys.argv[1:]
+def draw_bar_graph(labels, values, value_axis_label):
+    bars = plt.bar(labels, values, edgecolor="black")
+    
+    plt.bar_label(bars)
+    plt.xlabel("Matrix dimensions")
+    plt.ylabel(value_axis_label)
 
-benchmark_datas = []
-element_counts: list[int] | None = None
-peak_gbps: float | None = None
-peak_gflops: float | None = None
-for benchmark_file in benchmark_files:
-    benchmark_datas.append(load_benchmark_data(benchmark_file))
+    plt.xticks(rotation=45)
 
-    if element_counts:  
-        assert element_counts == benchmark_datas[-1].element_counts
-    else:
-        element_counts = benchmark_datas[-1].element_counts
-    if peak_gbps:
-        assert peak_gbps == benchmark_datas[-1].peak_gbps
-    else:
-        peak_gbps = benchmark_datas[-1].peak_gbps
-    if peak_gflops:
-        assert peak_gflops == benchmark_datas[-1].peak_gflops
-    else:
-        peak_gflops = benchmark_datas[-1].peak_gflops
+    plt.ylim(0, max(values)*1.1)
+    plt.savefig("bench_matmul.png", bbox_inches='tight')
 
-assert element_counts
-assert peak_gbps
-assert peak_gflops
+def draw_comparison_bar_graph(labels, value_axis_label, values_one, values_one_label, values_two, values_two_label):
+    bar_width = 1.2
+    label_pos_x = 4*np.arange(len(labels))
 
-# Draw plot
-plt.title("Bandwidth")
-fig, ax = plt.subplots(figsize=(15, 8))
+    bars_one = plt.bar(label_pos_x - bar_width/2, values_one, edgecolor="black", width=bar_width, label=values_one_label)
+    bars_two = plt.bar(label_pos_x + bar_width/2, values_two, edgecolor="black", width=bar_width, label=values_two_label)
+    plt.legend()
+    
+    plt.bar_label(bars_one, fontsize=8, bbox=dict(facecolor='white', alpha=0.4))
+    plt.bar_label(bars_two, fontsize=8, bbox=dict(facecolor='white', alpha=0.4))
 
-x_range = math.log2(element_counts[-1]) - math.log2(element_counts[0])
-ax.set_xlabel("Element Count")
-ax.set_xscale('log', base=2)
-plt.xlim(element_counts[0], element_counts[-1])
-ax.set_xticks(element_counts)
+    plt.xlabel("Matrix dimensions")
+    plt.ylabel(value_axis_label)
 
-ax.set_ylabel("Bandwidth (GBPS)")
-# ax.set_aspect(15/450, adjustable='box')
-start_y = 0
-end_y = 450 # TODO(achal): This should be calculated based on the X (visual) tick size 
-h = (end_y - start_y) / len(element_counts)
-ax.set_yticks([start_y + i*h for i in range(len(element_counts))])
+    plt.xticks(rotation=45)
+    plt.xticks(label_pos_x, labels)
 
-# Add grid and set background
-plt.grid(True, alpha=0.3)  # Add grid with transparency
-plt.gca().set_facecolor('black')  # Set plot background to black
+    plt.ylim(0, max(max(values_one), max(values_two))*1.1)
+    plt.savefig(f"bench_matmul.png", bbox_inches='tight')
 
-if peak_gbps:
-    plt.hlines(peak_gbps, element_counts[0], element_counts[-1], colors="red", linestyles="dashed", linewidth=1)
+# if len(sys.argv) <= 1:
+#     print("Usage: python plot_bench.py benchmark file(s)...")
+#     sys.exit(1)
+# 
+# benchmark_files = sys.argv[1:]
 
-legend_entries = []
-for benchmark_data in benchmark_datas:
-    plt.plot(benchmark_data.element_counts, benchmark_data.bandwidth_values, linewidth=2)
-    legend_entries.append(benchmark_data.file_name)
+# matmul_naive_results = load_benchmark_result("matmul_naive.bin")
+# draw_bar_graph(matmul_naive_results.labels, matmul_naive_results.gflops_values, "GFLOPS/s")
 
-plt.legend([
-    "Peak",
-    *legend_entries,
-], 
-    bbox_to_anchor=(1.05, 1), loc='upper left')
+matmul_naive_block_dim_16_results = load_benchmark_result("matmul_naive_block_dim_16.bin")
+matmul_naive_block_dim_32_results = load_benchmark_result("matmul_naive_block_dim_32.bin")
 
-plt.tight_layout()
-plt.savefig("bench_bandwidth.png", bbox_inches='tight')
+draw_comparison_bar_graph(matmul_naive_block_dim_16_results.labels, "GFLOPS/s", matmul_naive_block_dim_16_results.gflops_values, "Block dim 16", matmul_naive_block_dim_32_results.gflops_values, "Block dim 32")
+

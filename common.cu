@@ -1,5 +1,7 @@
-#ifndef COMMON_CUH
-#define COMMON_CUH
+#ifndef COMMON_CU
+#define COMMON_CU
+
+#include "core_types.h"
 
 #include <stdio.h>
 
@@ -56,6 +58,7 @@ inline static void GetCUDAErrorDetails(cudaError_t error, char const **error_nam
         char const *error_string = 0;\
         GetCUDAErrorDetails(error, &error_name, &error_string);\
         printf("CUDA Error on line %u: %s %s", line, error_name, error_string);\
+        assert(0);\
     }\
 }
 #else
@@ -116,7 +119,7 @@ static void GetPeakMeasurements(f64 *peak_gbps, f64 *peak_gflops, bool print_dev
         CUDACheck(cudaDeviceGetAttribute(&bus_width, cudaDevAttrGlobalMemoryBusWidth, device));
 
         // NOTE(achal): 2.0 is for double transfer (DDR).
-        *peak_gbps = (peak_mem_clock_freq*1000.0*2.0)*(bus_width/8.0)/(1024.0*1024.0*1024.0);
+        *peak_gbps = (peak_mem_clock_freq*1000.0*2.0)*(bus_width/8.0)/(1000.0*1000.0*1000.0);
     }
 
     if (print_device_info)
@@ -125,10 +128,10 @@ static void GetPeakMeasurements(f64 *peak_gbps, f64 *peak_gflops, bool print_dev
         printf("Compute capability: %d.%d\n", device_prop.major, device_prop.minor);
         printf("Total CUDA cores: %d\n", device_prop.multiProcessorCount*GetCUDACoresPerSM(device_prop.major, device_prop.minor));
 
-        printf("Total Global Memory: %.2f GB\n", (device_prop.totalGlobalMem/(1024.f*1024.f*1024.f)));
-        printf("Shared Memory (per block): %.2f KB\n", (device_prop.sharedMemPerBlock/1024.f));
-        printf("Total Constant Memory: %.2f KB\n", (device_prop.totalConstMem/1024.f));
-        printf("L2 Cache Size: %.2f KB\n", (device_prop.l2CacheSize/1024.f));
+        printf("Total Global Memory: %.2f GB\n", (device_prop.totalGlobalMem/(1000.f*1000.f*1000.f)));
+        printf("Shared Memory (per block): %.2f KB\n", (device_prop.sharedMemPerBlock/1000.f));
+        printf("Total Constant Memory: %.2f KB\n", (device_prop.totalConstMem/1000.f));
+        printf("L2 Cache Size: %.2f KB\n", (device_prop.l2CacheSize/1000.f));
 
         printf("Warp Size: %d threads\n", device_prop.warpSize);
         printf("Max threads per block: %d\n", device_prop.maxThreadsPerBlock);
@@ -141,4 +144,4 @@ static void GetPeakMeasurements(f64 *peak_gbps, f64 *peak_gflops, bool print_dev
     }
 }
 
-#endif
+#endif // COMMON_CU

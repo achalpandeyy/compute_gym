@@ -1,6 +1,8 @@
 #ifndef CORE_MEMORY_H
 #define CORE_MEMORY_H
 
+#include "core_types.h"
+
 #if defined(ARCH_X64)
 #define PageSize (KiloBytes(4))
 #elif defined(ARCH_ARM64) || defined(ARCH_WASM32)

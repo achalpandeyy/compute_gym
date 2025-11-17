@@ -26,8 +26,8 @@ virtual_arch="compute_89"
 real_arch="sm_89"
 
 # NOTE(achal): Defining macros for NVCC defines them for the host side as well.
-nvcc_common="nvcc.exe -I ../../../cccl/ -I ../../../cccl/libcudacxx/include -I ../../../cccl/cub -I ../../../cccl/thrust --use-local-env -std=c++17 --generate-code=arch=${virtual_arch},code=[${real_arch},${virtual_arch}] --diag-suppress 186 -Xcompiler \"$host_compile\""
-nvcc_debug="$nvcc_common -lineinfo -O0"
+nvcc_common="nvcc.exe -lineinfo -I ../../../cccl/ -I ../../../cccl/libcudacxx/include -I ../../../cccl/cub -I ../../../cccl/thrust --use-local-env -std=c++17 --generate-code=arch=${virtual_arch},code=[${real_arch},${virtual_arch}] --diag-suppress 186 -Xcompiler \"$host_compile\" --ptxas-options=-v"
+nvcc_debug="$nvcc_common -O0"
 nvcc_release="$nvcc_common -O3"
 
 if [ -v debug ];   then compile="$nvcc_debug";   fi
@@ -37,9 +37,9 @@ out="-o"
 ctime="../../../tools/ctime/ctime.exe"
 
 
-if [ -v reduce ];     then $ctime -begin .reduce.ctm;     eval "$compile ../reduce.cu    $out reduce";     $ctime -end .reduce.ctm $?;     fi
-if [ -v scan ];       then $ctime -begin .scan.ctm;       eval "$compile ../scan.cu      $out scan";       $ctime -end .scan.ctm $?;       fi
-if [ -v matmul ];     then $ctime -begin .matmul.ctm;     eval "$compile ../matmul.cu    $out matmul";     $ctime -end .matmul.ctm $?;     fi
+if [ -v reduce ];     then $ctime -begin .reduce.ctm;     eval "$compile ../reduce.cu               $out reduce";     $ctime -end .reduce.ctm $?;     fi
+if [ -v scan ];       then $ctime -begin .scan.ctm;       eval "$compile ../scan.cu                 $out scan";       $ctime -end .scan.ctm $?;       fi
+if [ -v matmul ];     then $ctime -begin .matmul.ctm;     eval "$compile ../matmul.cu cublas.lib    $out matmul";     $ctime -end .matmul.ctm $?;     fi
 
 # NOTE(achal): STREAM benchmark to measure peak sustained bandwidth.
 if [ -v CUDAStream ]; then $ctime -begin .CUDAStream.ctm; eval "$compile ../ext/BabelStream/main.cu      $out CUDAStream"; $ctime -end .CUDAStream.ctm $?; fi

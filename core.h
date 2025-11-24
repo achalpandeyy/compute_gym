@@ -1,6 +1,8 @@
 #ifndef CORE_H
 #define CORE_H
 
+#define IntegerCeil(x, y) (((x) + (y) - 1)/(y))
+
 inline static u32 FindMSB(u32 x)
 {
 #if COMPILER_MSVC
@@ -18,6 +20,18 @@ inline static u32 FindMSB(u32 x)
     // TODO(achal): When using the nvcc compiler I probably use the host compiler here.
     Assert(!"TODO");
 #endif
+}
+
+// Returns a multiple of `a` which is >= `x`
+inline static u64 GetMultipleOf(u64 x, u64 a)
+{
+	u64 rem = x % a;
+	if (rem == 0)
+		return x;
+    
+	u64 pad = a - rem;
+	u64 result = x + pad;
+	return result;
 }
 
 #define QueuePush(first, last, n)         \

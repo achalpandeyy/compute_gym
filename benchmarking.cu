@@ -97,7 +97,7 @@ f64 Benchmark(DataDescriptor<T> *desc)
                 Scratch data_scratch = ScratchBegin(scratch.arena);
                 Data<T> *data = CreateData<T, block_dim*coarse_factor>(data_scratch.arena, desc, stream);
                 
-                // FlushL2Cache();
+                FlushL2Cache();
                 CUDACheck(cudaEventRecord(start_event, stream));
                 FunctionToBenchmark<T, block_dim, coarse_factor>(data, stream);
                 CUDACheck(cudaEventRecord(stop_event, stream));
@@ -107,12 +107,15 @@ f64 Benchmark(DataDescriptor<T> *desc)
                 ScratchEnd(&data_scratch);                   
             }
             
-            f32 ms;
-            CUDACheck(cudaEventElapsedTime(&ms, start_event, stop_event));
-            duration_ms[rep] = (f64)ms;
-            
+            {
+                f32 temp;
+                CUDACheck(cudaEventElapsedTime(&temp, start_event, stop_event));
+                duration_ms[rep] = (f64)temp;
+            }
+
             if (rep > 0)
             {
+                ms_mean = 0.0;
                 int sample_count = rep + 1;
                 for (int i = 0; i < sample_count; ++i)
                     ms_mean += duration_ms[i];

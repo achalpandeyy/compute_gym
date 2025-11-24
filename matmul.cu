@@ -2,8 +2,9 @@
 
 #include "core_types.h"
 #include "core_memory.h"
+#include "core.h"
 
-#define PROFILER 1
+#define PROFILER 0
 #include "profiler.h"
 
 #include "common.cu"
@@ -86,7 +87,7 @@ __global__ void GEMMKernel2(u32 m, u32 n, u32 k, T alpha, T *A, T *B, T beta, T 
         u32 bx = tile_x*tile_dim + tx;
         u32 by = step_index*tile_dim + ty;
 
-        T b(0); // PxN
+        T b(0); // KxN
         if (bx < n && by < k)
             b = B[by*n + bx];
         
@@ -119,19 +120,80 @@ static void GEMM2(u32 m, u32 n, u32 k, T alpha, T *A, T *B, T beta, T *C, cudaSt
     GEMMKernel2<T, tile_dim><<<grid, block, 0, stream>>>(m, n, k, alpha, A, B, beta, C);
 }
 
-#if 0
-template <typename T>
-__global__ void GEMMKernel3(u32 m, u32 n, u32 k, )
+template <typename T, u32 tile_dim, u8 elements_per_thread>
+__global__ void GEMMKernel3(u32 m, u32 n, u32 k, T alpha, T *A, T *B, T beta, T *C)
 {
-    
+    __shared__ T tile_A[tile_dim][tile_dim];
+    __shared__ T tile_B[tile_dim][tile_dim];
+
+    // one block computes one output tile
+    u32 tile_x = blockIdx.x;
+    u32 tile_y = blockIdx.y;
+
+    u32 tx = threadIdx.x;
+    u32 ty = threadIdx.y;
+
+    T results[elements_per_thread] = {0};
+    u32 step_count = (k + tile_dim - 1)/tile_dim;
+    for (u32 step_index = 0; step_index < step_count; ++step_index)
+    {
+        u32 ax = step_index*tile_dim + tx;
+        u32 bx = tile_x*tile_dim + tx;
+        for (u8 i = 0; i < elements_per_thread; ++i)
+        {
+            u32 ay = tile_y*tile_dim + (ty*elements_per_thread + i);
+            u32 by = step_index*tile_dim + (ty*elements_per_thread + i);
+            
+            T a(0);
+            if (ax < k && ay < m)
+                a = A[ay*k + ax];
+
+            T b(0);
+            if (bx < n && by < k)
+                b = B[by*n + bx];
+
+            tile_A[ty*elements_per_thread + i][tx] = a;
+            tile_B[ty*elements_per_thread + i][tx] = b;
+        }
+        __syncthreads();
+
+        for (u32 index = 0; index < tile_dim; ++index)
+        {
+            T b = tile_B[index][tx];
+            for (u8 i = 0; i < elements_per_thread; ++i)
+            {
+                results[i] += tile_A[ty*elements_per_thread + i][index]*b;
+            }
+        }
+        __syncthreads();
+    }
+
+    u32 col = tile_x*tile_dim + tx;
+    for (u8 i = 0; i < elements_per_thread; ++i)
+    {
+        u32 row = tile_y*tile_dim + (ty*elements_per_thread + i);
+        if (row < m && col < n)
+        {
+            C[row*n + col] = alpha*results[i] + beta*C[row*n + col];
+        }
+    }
 }
 
 template <typename T>
-static void GEMM3()
+static void GEMM3(u32 m, u32 n, u32 k, T alpha, T *A, T *B, T beta, T *C, cudaStream_t stream)
 {
-    
+    enum
+    {
+        elements_per_thread = 8,
+        tile_dim = 64,
+    };
+    Assert((tile_dim % elements_per_thread) == 0);
+
+    dim3 block_dim(tile_dim, tile_dim/elements_per_thread, 1);
+    dim3 elements_per_block(block_dim.x, block_dim.y*elements_per_thread, block_dim.z);
+    dim3 grid_dim(IntegerCeil(n, elements_per_block.x), IntegerCeil(m, elements_per_block.y), 1);
+    GEMMKernel3<T, tile_dim, elements_per_thread><<<grid_dim, block_dim, 0, stream>>>(m, n, k, alpha, A, B, beta, C);
 }
-#endif
 
 template <typename T>
 struct DataDescriptor
@@ -262,6 +324,7 @@ static b32 ValidateGPUOutput(Arena *arena, Data<T> *data)
             break;
         }
     }
+
 #endif
 
     ScratchEnd(&scratch);
@@ -273,7 +336,27 @@ template <typename T, u32 block_dim, u32 coarse_factor>
 static void FunctionToBenchmark(Data<T> *data, cudaStream_t stream)
 {
     // GEMM(data->m, data->n, data->k, T(1), data->d_A, data->d_B, T(0), data->d_C, stream);
-    GEMM2(data->m, data->n, data->k, T(1), data->d_A, data->d_B, T(0), data->d_C, stream);
+    // GEMM2(data->m, data->n, data->k, T(1), data->d_A, data->d_B, T(0), data->d_C, stream);
+    GEMM3(data->m, data->n, data->k, T(1), data->d_A, data->d_B, T(0), data->d_C, stream);
+}
+
+template <typename T>
+static void Debug_PrintMatrix(Arena *arena, T *matrix, u32 m, u32 n)
+{
+    CUDACheck(cudaDeviceSynchronize());
+    
+    Scratch scratch = ScratchBegin(arena);
+    T *h_matrix = PushArrayZero(scratch.arena, T, m*n);
+    CUDACheck(cudaMemcpy(h_matrix, matrix, m*n*sizeof(*h_matrix), cudaMemcpyDeviceToHost));
+    for (u32 i = 0; i < m; ++i)
+    {
+        for (u32 j = 0; j < n; ++j)
+        {
+            printf("%10.6f ", h_matrix[i*n + j]);
+        }
+        printf("\n");
+    }
+    ScratchEnd(&scratch);
 }
 
 int main(int argc, char **argv)
@@ -287,19 +370,19 @@ int main(int argc, char **argv)
     }
 
     using InputType = f32;
-    if (1)
+    if (0)
     {
         Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
 
         DataDescriptor<InputType> *desc = PushStructZero(scratch.arena, DataDescriptor<InputType>);
-        u32 m = desc->m = 64;
-        u32 n = desc->n = 64;
-        u32 k = desc->k = 64;
+        u32 m = desc->m = 2048; // 15;
+        u32 n = desc->n = 2048; // 17;
+        u32 k = desc->k = 2048; // 16;
 
         Data<InputType> *data = CreateData<InputType, 0>(scratch.arena, desc, 0);
-
         // GEMM(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
-        GEMM2(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
+        // GEMM2(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
+        GEMM3(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
 
         if (!ValidateGPUOutput<InputType>(scratch.arena, data))
         {
@@ -315,11 +398,11 @@ int main(int argc, char **argv)
         ScratchEnd(&scratch);
     }
 
-    if (0)
+    if (1)
     {
         f64 peak_gbps = 0.0;
         f64 peak_gflops = 0.0;
-        GetPeakMeasurements(&peak_gbps, &peak_gflops, false);
+        GetPeakMeasurements(&peak_gbps, &peak_gflops, 1);
 
         printf("Bandwidth (Peak):\t%.2f GBPS\n", peak_gbps);
         printf("Throughput (Peak):\t%.2f GFLOPS\n", peak_gflops);
@@ -332,7 +415,6 @@ int main(int argc, char **argv)
         {
             
             u32 dims[] = {128, 256, 512, 1024, 2048, 4096};
-            // u32 dims[] = {1024};
             u32 skip_from_last = 0;
             
             printf("%-20s %-20s %-20s %-20s\n", "Input (m x n x k)", "GBPS", "GFLOPS", "Runtime (ms)");
@@ -369,7 +451,6 @@ int main(int argc, char **argv)
                 }
                 ScratchEnd(&scratch);
             }
-
         }
 
         if (file)

@@ -1,4 +1,4 @@
-from tinygrad import Tensor, UOp, Context, dtypes
+from tinygrad import Tensor, UOp
 
 def ewise_add_kernel(a:UOp, b:UOp, c:UOp) -> UOp:
     a,b,c = a.flatten(), b.flatten(), c.flatten()
@@ -6,9 +6,9 @@ def ewise_add_kernel(a:UOp, b:UOp, c:UOp) -> UOp:
     return c[i].store(a[i]+b[i]).end(i).sink()
 
 def ewise_add_test():
-    a = Tensor.ones(16, 16).contiguous()
-    b = Tensor.ones(16, 16).contiguous()
-    c = Tensor.empty(16, 16)
+    a = Tensor.ones(16*1024, 16*1024).contiguous()
+    b = Tensor.ones(16*1024, 16*1024).contiguous()
+    c = Tensor.empty(16*1024, 16*1024)
 
     # This just returns the graph, no kernel is executed here. In other words,
     # if we define a custom kernel in UOps, we will call it like this:

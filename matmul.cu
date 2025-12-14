@@ -1,4 +1,6 @@
+#include <cuda_fp16.h>
 #include <stdio.h>
+#include <type_traits>
 
 #include "core_types.h"
 #include "core_memory.h"
@@ -195,23 +197,63 @@ static void GEMM3(u32 m, u32 n, u32 k, T alpha, T *A, T *B, T beta, T *C, cudaSt
     GEMMKernel3<T, tile_dim, elements_per_thread><<<grid_dim, block_dim, 0, stream>>>(m, n, k, alpha, A, B, beta, C);
 }
 
+__global__ void GEMMKernel4(u32 m, u32 n, u32 k, half *A, half *B, f32 *C)
+{
+ int tid = threadIdx.x;
+ int group_id = tid >> 2;
+
+ half tile_a[8];
+ half tile_b[4];
+ f32 tile_c[4];
+
+ for(int i = 0; i < ArrayCount(tile_a); ++i)
+ {
+  int row = group_id + ((i/2) % 2)*8;
+  int col = 2*(tid % 4) + (i % 2) + (i/4)*8;
+  tile_a[i] = A[col*m + row];
+  A[row*k + col] = (u16)tid;
+ }
+
+ for(int i = 0; i < 4; ++i)
+ {
+  int row = 2*(tid % 4) + (i % 2) + ((i/2) % 2)*8;
+  int col = group_id;
+  tile_b[i] = B[row*n + col];
+  B[col*k + row] = (u16)tid;
+ }
+
+ for(int i = 0; i < 4; ++i)
+ {
+  int row = group_id + (i/2)*8;
+  int col = 2*(tid % 4) + (i % 2);
+  C[row*n + col] = (f32)tid;
+ }
+
+ #if 0
+ asm volatile(
+     "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+     ""
+ );
+ #endif
+}
+
 template <typename T>
 struct DataDescriptor
 {
-    u32 m, n, k;
+ u32 m, n, k;
 };
 
 template <typename T>
 struct Data
 {
-    u32 m, n, k;
+ u32 m, n, k;
 
-    T *d_A;
-    T *d_B;
-    T *d_C;
+ T *d_A;
+ T *d_B;
+ T *d_C;
 
-    T *h_A;
-    T *h_B;
+ T *h_A;
+ T *h_B;
 };
 
 template <typename T>
@@ -232,35 +274,35 @@ namespace std { using default_random_engine = mersenne_twister_engine<unsigned i
 template <typename T, u32 elements_per_block>
 static Data<T> *CreateData(Arena *arena, DataDescriptor<T> *descriptor, cudaStream_t stream)
 {
-    Data<T> *data = PushStructZero(arena, Data<T>);
-    u32 m = (data->m = descriptor->m);
-    u32 n = (data->n = descriptor->n);
-    u32 k = (data->k = descriptor->k);
+ Data<T> *data = PushStructZero(arena, Data<T>);
+ u32 m = (data->m = descriptor->m);
+ u32 n = (data->n = descriptor->n);
+ u32 k = (data->k = descriptor->k);
 
-    data->h_A = PushArrayZero(arena, T, m*k);
-    data->h_B = PushArrayZero(arena, T, k*n);
-    std::normal_distribution<T> distribution(0.0, 1.0);
-    std::default_random_engine generator(12345);
-    for (u32 i = 0; i < m*k; ++i) data->h_A[i] = distribution(generator);
-    for (u32 i = 0; i < k*n; ++i) data->h_B[i] = distribution(generator);
+ data->h_A = PushArrayZero(arena, T, m*k);
+ data->h_B = PushArrayZero(arena, T, k*n);
+ std::normal_distribution<T> distribution(0.0, 1.0);
+ std::default_random_engine generator(12345);
+ for (u32 i = 0; i < m*k; ++i) data->h_A[i] = distribution(generator);
+ for (u32 i = 0; i < k*n; ++i) data->h_B[i] = distribution(generator);
 
-    CUDACheck(cudaMalloc(&data->d_A, m*k*sizeof(*data->d_A)));
-    CUDACheck(cudaMalloc(&data->d_B, k*n*sizeof(*data->d_B)));
-    CUDACheck(cudaMalloc(&data->d_C, m*n*sizeof(*data->d_C)));
+ CUDACheck(cudaMalloc(&data->d_A, m*k*sizeof(*data->d_A)));
+ CUDACheck(cudaMalloc(&data->d_B, k*n*sizeof(*data->d_B)));
+ CUDACheck(cudaMalloc(&data->d_C, m*n*sizeof(*data->d_C)));
 
-    CUDACheck(cudaMemcpyAsync(data->d_A, data->h_A, m*k*sizeof(*data->d_A), cudaMemcpyHostToDevice, stream));
-    CUDACheck(cudaMemcpyAsync(data->d_B, data->h_B, k*n*sizeof(*data->d_B), cudaMemcpyHostToDevice, stream));
-    CUDACheck(cudaMemsetAsync(data->d_C, 0, m*n*sizeof(*data->d_C), stream));
+ CUDACheck(cudaMemcpyAsync(data->d_A, data->h_A, m*k*sizeof(*data->d_A), cudaMemcpyHostToDevice, stream));
+ CUDACheck(cudaMemcpyAsync(data->d_B, data->h_B, k*n*sizeof(*data->d_B), cudaMemcpyHostToDevice, stream));
+ CUDACheck(cudaMemsetAsync(data->d_C, 0, m*n*sizeof(*data->d_C), stream));
 
-    return data;
+ return data;
 }
 
 template <typename T>
 static void DestroyData(Data<T> *data)
 {
-    CUDACheck(cudaFree(data->d_C));
-    CUDACheck(cudaFree(data->d_B));
-    CUDACheck(cudaFree(data->d_A));
+ CUDACheck(cudaFree(data->d_C));
+ CUDACheck(cudaFree(data->d_B));
+ CUDACheck(cudaFree(data->d_A));
 }
 
 template <typename T>
@@ -279,7 +321,7 @@ static b32 ValidateGPUOutput(Arena *arena, Data<T> *data)
     f64 base_tolerance = 1e-2;
     f64 tolerance = base_tolerance * sqrt(k/64.0); // NOTE(achal): This is a heuristic to scale the tolerance based on the matrix size.
 
-#if 1
+#if 0
     T *C_ref = PushArrayZero(scratch.arena, T, m*n);
 #if 1
     {
@@ -335,127 +377,169 @@ static b32 ValidateGPUOutput(Arena *arena, Data<T> *data)
 template <typename T, u32 block_dim, u32 coarse_factor>
 static void FunctionToBenchmark(Data<T> *data, cudaStream_t stream)
 {
-    // GEMM(data->m, data->n, data->k, T(1), data->d_A, data->d_B, T(0), data->d_C, stream);
-    // GEMM2(data->m, data->n, data->k, T(1), data->d_A, data->d_B, T(0), data->d_C, stream);
-    GEMM3(data->m, data->n, data->k, T(1), data->d_A, data->d_B, T(0), data->d_C, stream);
+ // GEMM(data->m, data->n, data->k, T(1), data->d_A, data->d_B, T(0), data->d_C, stream);
+ // GEMM2(data->m, data->n, data->k, T(1), data->d_A, data->d_B, T(0), data->d_C, stream);
+ GEMM3(data->m, data->n, data->k, T(1), data->d_A, data->d_B, T(0), data->d_C, stream);
 }
 
 template <typename T>
-static void Debug_PrintMatrix(Arena *arena, T *matrix, u32 m, u32 n)
+static void Debug_PrintMatrix(Arena *arena, T *matrix, u32 m, u32 n, bool col_major = true)
 {
-    CUDACheck(cudaDeviceSynchronize());
-    
-    Scratch scratch = ScratchBegin(arena);
-    T *h_matrix = PushArrayZero(scratch.arena, T, m*n);
-    CUDACheck(cudaMemcpy(h_matrix, matrix, m*n*sizeof(*h_matrix), cudaMemcpyDeviceToHost));
-    for (u32 i = 0; i < m; ++i)
-    {
-        for (u32 j = 0; j < n; ++j)
-        {
-            printf("%10.6f ", h_matrix[i*n + j]);
-        }
-        printf("\n");
-    }
-    ScratchEnd(&scratch);
+ CUDACheck(cudaDeviceSynchronize());
+ 
+ Scratch scratch = ScratchBegin(arena);
+ T *h_matrix = PushArrayZero(scratch.arena, T, m*n);
+ CUDACheck(cudaMemcpy(h_matrix, matrix, m*n*sizeof(*h_matrix), cudaMemcpyDeviceToHost));
+ for (u32 r = 0; r < m; ++r)
+ {
+  for (u32 c = 0; c < n; ++c)
+  {
+   int index = col_major ? (c*m + r) : (r*n + c);
+   if constexpr (std::is_floating_point<T>::value)
+    printf("%10.6f ", h_matrix[index]);
+   else
+    printf("%2d ", (u16)h_matrix[index]);
+  }
+  printf("\n");
+ }
+ ScratchEnd(&scratch);
 }
 
 int main(int argc, char **argv)
 {
-    BeginProfiler();
+ BeginProfiler();
 
-    char *file_name = 0;
-    if (argc == 2)
-    {
-        file_name = argv[1];
-    }
+ char *file_name = 0;
+ if (argc == 2)
+ {
+  file_name = argv[1];
+ }
 
-    using InputType = f32;
-    if (0)
-    {
-        Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
+ {
+  Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
 
-        DataDescriptor<InputType> *desc = PushStructZero(scratch.arena, DataDescriptor<InputType>);
-        u32 m = desc->m = 2048; // 15;
-        u32 n = desc->n = 2048; // 17;
-        u32 k = desc->k = 2048; // 16;
+  int M = 16;
+  int K = 16;
+  int N = 8;
+  half *h_A = PushArrayZero(scratch.arena, half, M*K);
+  for(int r = 0; r < M; ++r) for(int c = 0; c < K; ++c) h_A[r*K + c] = __float2half(1.f); // row-major
+  half *h_B = PushArrayZero(scratch.arena, half, K*N);
+  for(int c = 0; c < N; ++c) for(int r = 0; r < K; ++r) h_B[c*K + r] = __float2half(1.f); // col-major
+  
+  half *d_A = 0, *d_B = 0;
+  CUDACheck(cudaMalloc(&d_A, M*K*sizeof(half)));
+  CUDACheck(cudaMemcpy(d_A, h_A, M*K*sizeof(half), cudaMemcpyHostToDevice));
+  CUDACheck(cudaMalloc(&d_B, K*N*sizeof(half)));
+  CUDACheck(cudaMemcpy(d_B, h_B, K*N*sizeof(half), cudaMemcpyHostToDevice));
 
-        Data<InputType> *data = CreateData<InputType, 0>(scratch.arena, desc, 0);
-        // GEMM(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
-        // GEMM2(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
-        GEMM3(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
+  static_assert(std::is_trivially_constructible<half>::value);
+  
+  f32 *d_C = 0;
+  CUDACheck(cudaMalloc(&d_C, M*N*sizeof(f32)));
 
-        if (!ValidateGPUOutput<InputType>(scratch.arena, data))
-        {
-            printf("Failed\n");
-            exit(1);
-        }
-        else
-        {
-            printf("Passed\n");
-        }
+  GEMMKernel4<<<1, 32>>>(M, N, K, d_A, d_B, d_C);
 
-        DestroyData<InputType>(data);
-        ScratchEnd(&scratch);
-    }
+  printf("A:\n");
+  Debug_PrintMatrix(scratch.arena, d_A, M, K, false);
+  printf("B:\n");
+  Debug_PrintMatrix(scratch.arena, d_B, K, N);
 
-    if (1)
-    {
-        f64 peak_gbps = 0.0;
-        f64 peak_gflops = 0.0;
-        GetPeakMeasurements(&peak_gbps, &peak_gflops, 1);
+  printf("C:\n");
+  Debug_PrintMatrix(scratch.arena, d_C, M, N, false);
 
-        printf("Bandwidth (Peak):\t%.2f GBPS\n", peak_gbps);
-        printf("Throughput (Peak):\t%.2f GFLOPS\n", peak_gflops);
-        printf("Arithmetic intensity (Peak):\t%.2f FLOPS/byte\n", peak_gflops/peak_gbps);
+  ScratchEnd(&scratch);
 
-        FILE *file = 0;
-        if (file_name)
-            file = fopen(file_name, "wb");
+  exit(1);
+ }
 
-        {
-            
-            u32 dims[] = {128, 256, 512, 1024, 2048, 4096};
-            u32 skip_from_last = 0;
-            
-            printf("%-20s %-20s %-20s %-20s\n", "Input (m x n x k)", "GBPS", "GFLOPS", "Runtime (ms)");
-            for (u32 i = 0; i < ArrayCount(dims) - skip_from_last; ++i)
-            {
-                Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
+ using InputType = f32;
+ if (0)
+ {
+     Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
 
-                DataDescriptor<InputType> *desc = PushStructZero(scratch.arena, DataDescriptor<InputType>);
-                desc->m = dims[i];
-                desc->n = dims[i];
-                desc->k = dims[i];
-                f64 ms = Benchmark<InputType, 0, 0>(desc);
+     DataDescriptor<InputType> *desc = PushStructZero(scratch.arena, DataDescriptor<InputType>);
+     u32 m = desc->m = 2048; // 15;
+     u32 n = desc->n = 2048; // 17;
+     u32 k = desc->k = 2048; // 16;
 
-                f64 gbps = (1000.0*GetDataTransferSize(desc))/(ms*1000.0*1000.0*1000.0);
-                f64 gflops = (1000.0*GetFLOPS(desc))/(ms*1000.0*1000.0*1000.0);
+     Data<InputType> *data = CreateData<InputType, 0>(scratch.arena, desc, 0);
+     // GEMM(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
+     // GEMM2(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
+     GEMM3(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
 
-                // NOTE(achal): snprintf will write the null terminator but its return value will not include it.
-                u32 max_input_label_length = 1023 + 1;
+     if (!ValidateGPUOutput<InputType>(scratch.arena, data))
+     {
+         printf("Failed\n");
+         exit(1);
+     }
+     else
+     {
+         printf("Passed\n");
+     }
 
-                u8 *input_label = PushArrayZero(scratch.arena, u8, max_input_label_length);
-                u32 label_length = (u32)snprintf((char *)input_label, max_input_label_length, "%ux%ux%u", dims[i], dims[i], dims[i]);
-                Assert(label_length <= max_input_label_length-1);
-                
-                printf("%-20s %-20.6f %-20.6f %-20.6f\n", (char *)input_label, gbps, gflops, ms);
+     DestroyData<InputType>(data);
+     ScratchEnd(&scratch);
+ }
 
-                if (file)
-                {
-                    fwrite(&label_length, sizeof(u32), 1, file);
-                    fwrite(input_label, sizeof(u8), label_length, file);
+ if (1)
+ {
+     f64 peak_gbps = 0.0;
+     f64 peak_gflops = 0.0;
+     GetPeakMeasurements(&peak_gbps, &peak_gflops, 1);
 
-                    fwrite(&gbps, sizeof(f64), 1, file);
-                    fwrite(&gflops, sizeof(f64), 1, file);
-                    fwrite(&ms, sizeof(f64), 1, file);
-                }
-                ScratchEnd(&scratch);
-            }
-        }
+     printf("Bandwidth (Peak):\t%.2f GBPS\n", peak_gbps);
+     printf("Throughput (Peak):\t%.2f GFLOPS\n", peak_gflops);
+     printf("Arithmetic intensity (Peak):\t%.2f FLOPS/byte\n", peak_gflops/peak_gbps);
 
-        if (file)
-            fclose(file);
-    }
+     FILE *file = 0;
+     if (file_name)
+         file = fopen(file_name, "wb");
+
+     {
+         
+         // u32 dims[] = {128, 256, 512, 1024, 2048, 4096};
+         u32 dims[] = {4096};
+         u32 skip_from_last = 0;
+         
+         printf("%-20s %-20s %-20s %-20s\n", "Input (m x n x k)", "GBPS", "GFLOPS", "Runtime (ms)");
+         for (u32 i = 0; i < ArrayCount(dims) - skip_from_last; ++i)
+         {
+             Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
+
+             DataDescriptor<InputType> *desc = PushStructZero(scratch.arena, DataDescriptor<InputType>);
+             desc->m = dims[i];
+             desc->n = dims[i];
+             desc->k = dims[i];
+             f64 ms = Benchmark<InputType, 0, 0>(desc);
+
+             f64 gbps = (1000.0*GetDataTransferSize(desc))/(ms*1000.0*1000.0*1000.0);
+             f64 gflops = (1000.0*GetFLOPS(desc))/(ms*1000.0*1000.0*1000.0);
+
+             // NOTE(achal): snprintf will write the null terminator but its return value will not include it.
+             u32 max_input_label_length = 1023 + 1;
+
+             u8 *input_label = PushArrayZero(scratch.arena, u8, max_input_label_length);
+             u32 label_length = (u32)snprintf((char *)input_label, max_input_label_length, "%ux%ux%u", dims[i], dims[i], dims[i]);
+             Assert(label_length <= max_input_label_length-1);
+             
+             printf("%-20s %-20.6f %-20.6f %-20.6f\n", (char *)input_label, gbps, gflops, ms);
+
+             if (file)
+             {
+                 fwrite(&label_length, sizeof(u32), 1, file);
+                 fwrite(input_label, sizeof(u8), label_length, file);
+
+                 fwrite(&gbps, sizeof(f64), 1, file);
+                 fwrite(&gflops, sizeof(f64), 1, file);
+                 fwrite(&ms, sizeof(f64), 1, file);
+             }
+             ScratchEnd(&scratch);
+         }
+     }
+
+     if (file)
+         fclose(file);
+ }
 
     EndProfiler();
     PrintPerformanceProfile();

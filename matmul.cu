@@ -204,37 +204,41 @@ __global__ void GEMMKernel4(u32 m, u32 n, u32 k, half *A, half *B, f32 *C)
 
  half tile_a[8];
  half tile_b[4];
- f32 tile_c[4];
+ f32 tile_c[4] = {0.f, 0.f, 0.f, 0.f};
 
  for(int i = 0; i < ArrayCount(tile_a); ++i)
  {
   int row = group_id + ((i/2) % 2)*8;
   int col = 2*(tid % 4) + (i % 2) + (i/4)*8;
-  tile_a[i] = A[col*m + row];
-  A[row*k + col] = (u16)tid;
+  tile_a[i] = A[row*k + col];
  }
 
- for(int i = 0; i < 4; ++i)
+ for(int i = 0; i < ArrayCount(tile_b); ++i)
  {
   int row = 2*(tid % 4) + (i % 2) + ((i/2) % 2)*8;
   int col = group_id;
-  tile_b[i] = B[row*n + col];
-  B[col*k + row] = (u16)tid;
+  tile_b[i] = B[col*k + row];
  }
 
- for(int i = 0; i < 4; ++i)
+ u32 *regs_a = (u32 *)tile_a;
+ u32 *regs_b = (u32 *)tile_b;
+ asm(
+  "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+  "{%0, %1, %2, %3}, " // d
+  "{%4, %5, %6, %7}, " // a
+  "{%8, %9}, " // b
+  "{%0, %1, %2, %3};\n" // c
+  : "+f"(tile_c[0]), "+f"(tile_c[1]), "+f"(tile_c[2]), "+f"(tile_c[3])
+  : "r"(regs_a[0]),  "r"(regs_a[1]),  "r"(regs_a[2]),  "r"(regs_a[3]), 
+    "r"(regs_b[0]),  "r"(regs_b[1])
+ );
+
+ for(int i = 0; i < ArrayCount(tile_c); ++i)
  {
   int row = group_id + (i/2)*8;
   int col = 2*(tid % 4) + (i % 2);
-  C[row*n + col] = (f32)tid;
+  C[row*n + col] = tile_c[i];
  }
-
- #if 0
- asm volatile(
-     "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-     ""
- );
- #endif
 }
 
 template <typename T>
@@ -259,13 +263,13 @@ struct Data
 template <typename T>
 static u64 GetDataTransferSize(DataDescriptor<T> *descriptor)
 {
-    return (descriptor->m*descriptor->k + descriptor->k*descriptor->n + descriptor->m*descriptor->n)*sizeof(T);
+ return (descriptor->m*descriptor->k + descriptor->k*descriptor->n + descriptor->m*descriptor->n)*sizeof(T);
 }
 
 template <typename T>
 static u64 GetFLOPS(DataDescriptor<T> *descriptor)
 {
-    return 2ull*descriptor->m*descriptor->n*descriptor->k;
+ return 2ull*descriptor->m*descriptor->n*descriptor->k;
 }
 
 // NOTE(achal): clangd can't find it from the <random> header, for some reason.

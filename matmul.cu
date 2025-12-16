@@ -54,10 +54,10 @@ __global__ void GEMMKernel(u32 m, u32 n, u32 k, T alpha, T *A, T *B, T beta, T *
 template <typename T>
 static void GEMM(u32 m, u32 n, u32 k, T alpha, T *A, T *B, T beta, T *C, cudaStream_t stream)
 {
-    enum { block_dim = 32 };
-    dim3 block(block_dim, block_dim, 1);
-    dim3 grid((n + block_dim - 1)/block_dim, (m + block_dim - 1)/block_dim, 1);
-    GEMMKernel<T><<<grid, block, 0, stream>>>(m, n, k, alpha, A, B, beta, C);
+ enum { block_dim = 32 };
+ dim3 block(block_dim, block_dim, 1);
+ dim3 grid((n + block_dim - 1)/block_dim, (m + block_dim - 1)/block_dim, 1);
+ GEMMKernel<T><<<grid, block, 0, stream>>>(m, n, k, alpha, A, B, beta, C);
 }
 
 template <typename T, u32 tile_dim>
@@ -197,31 +197,53 @@ static void GEMM3(u32 m, u32 n, u32 k, T alpha, T *A, T *B, T beta, T *C, cudaSt
     GEMMKernel3<T, tile_dim, elements_per_thread><<<grid_dim, block_dim, 0, stream>>>(m, n, k, alpha, A, B, beta, C);
 }
 
-__global__ void GEMMKernel4(u32 m, u32 n, u32 k, half *A, half *B, f32 *C)
+__global__ void GEMMKernel4(u32 M, u32 N, u32 K, half *A, half *B, f32 *C)
 {
+ enum {m = 16, n = 8, k = 16};
+
+ __shared__ alignas(16) half shared_A[m][k];
+ __shared__ alignas(16) half shared_B[k][n];
+
+ int bidx = blockIdx.x;
+ int bidy = blockIdx.y;
+ 
  int tid = threadIdx.x;
- int group_id = tid >> 2;
+ if(tid < 16)
+ {
+  for(int i = 0; i < 16; ++i)
+   shared_A[tid][i] = A[bidy*m*k + tid*k + i];
+
+  for(int i = 0; i < 8; ++i)
+   shared_B[tid][i] = B[bidx*k*n + i*n + tid];
+ }
 
  half tile_a[8];
- half tile_b[4];
- f32 tile_c[4] = {0.f, 0.f, 0.f, 0.f};
-
- for(int i = 0; i < ArrayCount(tile_a); ++i)
- {
-  int row = group_id + ((i/2) % 2)*8;
-  int col = 2*(tid % 4) + (i % 2) + (i/4)*8;
-  tile_a[i] = A[row*k + col];
- }
-
- for(int i = 0; i < ArrayCount(tile_b); ++i)
- {
-  int row = 2*(tid % 4) + (i % 2) + ((i/2) % 2)*8;
-  int col = group_id;
-  tile_b[i] = B[col*k + row];
- }
-
  u32 *regs_a = (u32 *)tile_a;
+ u32 addr_a = __cvta_generic_to_shared(&shared_A[tid % 16][(tid / 16)*8]);
+ asm(
+  "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+  "{%0, %1, %2, %3}, "
+  "[%4];"
+  : "=r"(regs_a[0]), "=r"(regs_a[1]), "=r"(regs_a[2]), "=r"(regs_a[3])
+  : "r"(addr_a)
+ );
+ 
+ // Even though the last sixteen threads, in the warp, have the
+ // same smem address as the first sixteen, the instruction works
+ // in a way that all the threads end up with the correct values,
+ // as expected by mma.
+ half tile_b[4];
  u32 *regs_b = (u32 *)tile_b;
+ u32 addr_b = __cvta_generic_to_shared(&shared_B[tid % 16][0]);
+ asm(
+  "ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
+  "{%0, %1}, "
+  "[%2];"
+  : "=r"(regs_b[0]), "=r"(regs_b[1])
+  : "r"(addr_b)
+ );
+ 
+ f32 tile_c[4] = {0.f, 0.f, 0.f, 0.f};
  asm(
   "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
   "{%0, %1, %2, %3}, " // d
@@ -233,11 +255,12 @@ __global__ void GEMMKernel4(u32 m, u32 n, u32 k, half *A, half *B, f32 *C)
     "r"(regs_b[0]),  "r"(regs_b[1])
  );
 
+ int group_id = tid >> 2;
  for(int i = 0; i < ArrayCount(tile_c); ++i)
  {
   int row = group_id + (i/2)*8;
   int col = 2*(tid % 4) + (i % 2);
-  C[row*n + col] = tile_c[i];
+  C[bidy*gridDim.x*m*n + bidx*m*n + row*n + col] = tile_c[i];
  }
 }
 
@@ -422,9 +445,9 @@ int main(int argc, char **argv)
  {
   Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
 
-  int M = 16;
+  int M = 32;
   int K = 16;
-  int N = 8;
+  int N = 16;
   half *h_A = PushArrayZero(scratch.arena, half, M*K);
   for(int r = 0; r < M; ++r) for(int c = 0; c < K; ++c) h_A[r*K + c] = __float2half(1.f); // row-major
   half *h_B = PushArrayZero(scratch.arena, half, K*N);
@@ -440,8 +463,11 @@ int main(int argc, char **argv)
   
   f32 *d_C = 0;
   CUDACheck(cudaMalloc(&d_C, M*N*sizeof(f32)));
-
-  GEMMKernel4<<<1, 32>>>(M, N, K, d_A, d_B, d_C);
+  Assert(K == 16);
+  Assert((N%8) == 0);
+  Assert((M%16) == 0);
+  dim3 grid_dim(N/8, M/16, 1);
+  GEMMKernel4<<<grid_dim, 32>>>(M, N, K, d_A, d_B, d_C);
 
   printf("A:\n");
   Debug_PrintMatrix(scratch.arena, d_A, M, K, false);

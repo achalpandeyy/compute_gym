@@ -206,61 +206,64 @@ __global__ void GEMMKernel4(u32 M, u32 N, u32 K, half *A, half *B, f32 *C)
 
  int bidx = blockIdx.x;
  int bidy = blockIdx.y;
- 
  int tid = threadIdx.x;
- if(tid < 16)
- {
-  for(int i = 0; i < 16; ++i)
-   shared_A[tid][i] = A[bidy*m*k + tid*k + i];
 
-  for(int i = 0; i < 8; ++i)
-   shared_B[tid][i] = B[bidx*k*n + i*n + tid];
- }
-
- half tile_a[8];
- u32 *regs_a = (u32 *)tile_a;
- u32 addr_a = __cvta_generic_to_shared(&shared_A[tid % 16][(tid / 16)*8]);
- asm(
-  "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
-  "{%0, %1, %2, %3}, "
-  "[%4];"
-  : "=r"(regs_a[0]), "=r"(regs_a[1]), "=r"(regs_a[2]), "=r"(regs_a[3])
-  : "r"(addr_a)
- );
- 
- // Even though the last sixteen threads, in the warp, have the
- // same smem address as the first sixteen, the instruction works
- // in a way that all the threads end up with the correct values,
- // as expected by mma.
- half tile_b[4];
- u32 *regs_b = (u32 *)tile_b;
- u32 addr_b = __cvta_generic_to_shared(&shared_B[tid % 16][0]);
- asm(
-  "ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
-  "{%0, %1}, "
-  "[%2];"
-  : "=r"(regs_b[0]), "=r"(regs_b[1])
-  : "r"(addr_b)
- );
- 
  f32 tile_c[4] = {0.f, 0.f, 0.f, 0.f};
- asm(
-  "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-  "{%0, %1, %2, %3}, " // d
-  "{%4, %5, %6, %7}, " // a
-  "{%8, %9}, " // b
-  "{%0, %1, %2, %3};\n" // c
-  : "+f"(tile_c[0]), "+f"(tile_c[1]), "+f"(tile_c[2]), "+f"(tile_c[3])
-  : "r"(regs_a[0]),  "r"(regs_a[1]),  "r"(regs_a[2]),  "r"(regs_a[3]), 
-    "r"(regs_b[0]),  "r"(regs_b[1])
- );
+ for(int step = 0; step < K/k; ++step)
+ {
+  if(tid < 16)
+  {
+   for(int i = 0; i < 16; ++i)
+    shared_A[tid][i] = A[bidy*(m*k*(K/k)) + tid*(k*(K/k)) + step*(k) + i*(1)];
+ 
+   for(int i = 0; i < 8; ++i)
+    shared_B[tid][i] = B[bidx*(n*k*(K/k)) + i*(k*(K/k)) + step*(k) + tid*(1)];
+  }
+
+  half tile_a[8];
+  u32 *regs_a = (u32 *)tile_a;
+  u32 addr_a = __cvta_generic_to_shared(&shared_A[tid % 16][(tid / 16)*8]);
+  asm volatile(
+   "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+   "{%0, %1, %2, %3}, "
+   "[%4];"
+   : "=r"(regs_a[0]), "=r"(regs_a[1]), "=r"(regs_a[2]), "=r"(regs_a[3])
+   : "r"(addr_a)
+  );
+
+  // Even though the last sixteen threads, in the warp, have the
+  // same smem address as the first sixteen, the instruction works
+  // in a way that all the threads end up with the correct values,
+  // as expected by mma.
+  half tile_b[4];
+  u32 *regs_b = (u32 *)tile_b;
+  u32 addr_b = __cvta_generic_to_shared(&shared_B[tid % 16][0]);
+  asm volatile(
+   "ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
+   "{%0, %1}, "
+   "[%2];"
+   : "=r"(regs_b[0]), "=r"(regs_b[1])
+   : "r"(addr_b)
+  );
+
+  asm volatile(
+   "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+   "{%0, %1, %2, %3}, " // d
+   "{%4, %5, %6, %7}, " // a
+   "{%8, %9}, " // b
+   "{%0, %1, %2, %3};\n" // c
+   : "+f"(tile_c[0]), "+f"(tile_c[1]), "+f"(tile_c[2]), "+f"(tile_c[3])
+   : "r"(regs_a[0]),  "r"(regs_a[1]),  "r"(regs_a[2]),  "r"(regs_a[3]), 
+     "r"(regs_b[0]),  "r"(regs_b[1])
+  );
+ }
 
  int group_id = tid >> 2;
  for(int i = 0; i < ArrayCount(tile_c); ++i)
  {
   int row = group_id + (i/2)*8;
   int col = 2*(tid % 4) + (i % 2);
-  C[bidy*gridDim.x*m*n + bidx*m*n + row*n + col] = tile_c[i];
+  C[bidy*(m*(N/n)*n) + row*((N/n)*n) + bidx*(n) + col*(1)] = tile_c[i];
  }
 }
 
@@ -445,13 +448,32 @@ int main(int argc, char **argv)
  {
   Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
 
-  int M = 32;
-  int K = 16;
-  int N = 16;
+  int M = 32; Assert((M%16) == 0);
+  int K = 32; Assert((K%16) == 0);
+  int N = 16; Assert((N% 8) == 0);
+  
+  enum {m = 16, n = 8, k = 16};
+  static_assert(std::is_trivially_constructible<half>::value);
+
   half *h_A = PushArrayZero(scratch.arena, half, M*K);
-  for(int r = 0; r < M; ++r) for(int c = 0; c < K; ++c) h_A[r*K + c] = __float2half(1.f); // row-major
+  for(int r = 0; r < M; ++r)
+  {
+   for(int c = 0; c < K; ++c)
+   {
+    f32 v = (f32)((r/m)*(K/k) + (c/k));
+    h_A[r*K + c] = __float2half(v); // row-major
+   }
+  }
+
   half *h_B = PushArrayZero(scratch.arena, half, K*N);
-  for(int c = 0; c < N; ++c) for(int r = 0; r < K; ++r) h_B[c*K + r] = __float2half(1.f); // col-major
+  for(int r = 0; r < K; ++r)
+  {
+   for(int c = 0; c < N; ++c)
+   {
+    f32 v = (f32)((r/k)*(N/n) + (c/n));
+    h_B[c*K + r] = __float2half(v); // col-major
+   }
+  }
   
   half *d_A = 0, *d_B = 0;
   CUDACheck(cudaMalloc(&d_A, M*K*sizeof(half)));
@@ -459,27 +481,23 @@ int main(int argc, char **argv)
   CUDACheck(cudaMalloc(&d_B, K*N*sizeof(half)));
   CUDACheck(cudaMemcpy(d_B, h_B, K*N*sizeof(half), cudaMemcpyHostToDevice));
 
-  static_assert(std::is_trivially_constructible<half>::value);
-  
   f32 *d_C = 0;
   CUDACheck(cudaMalloc(&d_C, M*N*sizeof(f32)));
-  Assert(K == 16);
-  Assert((N%8) == 0);
-  Assert((M%16) == 0);
-  dim3 grid_dim(N/8, M/16, 1);
+  dim3 grid_dim(N/n, M/m, 1);
   GEMMKernel4<<<grid_dim, 32>>>(M, N, K, d_A, d_B, d_C);
 
-  printf("A:\n");
-  Debug_PrintMatrix(scratch.arena, d_A, M, K, false);
-  printf("B:\n");
-  Debug_PrintMatrix(scratch.arena, d_B, K, N);
+  // printf("A:\n");
+  // Debug_PrintMatrix(scratch.arena, d_A, M, K, false);
+  // printf("B:\n");
+  // Debug_PrintMatrix(scratch.arena, d_B, K, N);
 
+  CUDACheck(cudaDeviceSynchronize());
   printf("C:\n");
   Debug_PrintMatrix(scratch.arena, d_C, M, N, false);
 
   ScratchEnd(&scratch);
 
-  exit(1);
+  return 0;
  }
 
  using InputType = f32;

@@ -442,6 +442,7 @@ static void FunctionToBenchmark(Data<T> *data, cudaStream_t stream)
  // GEMM(data->m, data->n, data->k, T(1), data->d_A, data->d_B, T(0), data->d_C, stream);
  // GEMM2(data->m, data->n, data->k, T(1), data->d_A, data->d_B, T(0), data->d_C, stream);
  // GEMM3(data->m, data->n, data->k, T(1), data->d_A, data->d_B, T(0), data->d_C, stream);
+ GEMM4<half>(data->m, data->n, data->k, T(1), data->d_A, data->d_B, T(0), data->d_C, stream);
 }
 
 template <typename T>
@@ -478,14 +479,14 @@ int main(int argc, char **argv)
  }
 
  using InputType = half;
- if (1)
+ if(0)
  {
   Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
 
   DataDescriptor<InputType> *desc = PushStructZero(scratch.arena, DataDescriptor<InputType>);
-  u32 m = desc->m = 2048; // 15;
-  u32 n = desc->n = 2048; // 17;
-  u32 k = desc->k = 2048; // 16;
+  u32 m = desc->m = 4096; // 15;
+  u32 n = desc->n = 4096; // 17;
+  u32 k = desc->k = 4096; // 16;
 
   Data<InputType> *data = CreateData<InputType, 0>(scratch.arena, desc, 0);
   // GEMM(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
@@ -507,64 +508,62 @@ int main(int argc, char **argv)
   ScratchEnd(&scratch);
  }
 
- if (0)
+ if(1)
  {
-     f64 peak_gbps = 0.0;
-     f64 peak_gflops = 0.0;
-     GetPeakMeasurements(&peak_gbps, &peak_gflops, 1);
+  f64 peak_gbps = 0.0;
+  f64 peak_gflops = 0.0;
+  GetPeakMeasurements(&peak_gbps, &peak_gflops, 1);
 
-     printf("Bandwidth (Peak):\t%.2f GBPS\n", peak_gbps);
-     printf("Throughput (Peak):\t%.2f GFLOPS\n", peak_gflops);
-     printf("Arithmetic intensity (Peak):\t%.2f FLOPS/byte\n", peak_gflops/peak_gbps);
+  printf("Bandwidth (Peak):\t%.2f GBPS\n", peak_gbps);
+  printf("Throughput (Peak):\t%.2f GFLOPS\n", peak_gflops);
+  printf("Arithmetic intensity (Peak):\t%.2f FLOPS/byte\n", peak_gflops/peak_gbps);
 
-     FILE *file = 0;
-     if (file_name)
-         file = fopen(file_name, "wb");
+  FILE *file = 0;
+  if(file_name)
+   file = fopen(file_name, "wb");
 
-     {
-         
-         // u32 dims[] = {128, 256, 512, 1024, 2048, 4096};
-         u32 dims[] = {4096};
-         u32 skip_from_last = 0;
-         
-         printf("%-20s %-20s %-20s %-20s\n", "Input (m x n x k)", "GBPS", "GFLOPS", "Runtime (ms)");
-         for (u32 i = 0; i < ArrayCount(dims) - skip_from_last; ++i)
-         {
-             Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
+  {
+   u32 dims[] = {128, 256, 512, 1024, 2048, 4096};
+   u32 skip_from_last = 0;
+   
+   printf("%-20s %-20s %-20s %-20s\n", "Input (m x n x k)", "GBPS", "GFLOPS", "Runtime (ms)");
+   for(u32 i = 0; i < ArrayCount(dims) - skip_from_last; ++i)
+   {
+    Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
 
-             DataDescriptor<InputType> *desc = PushStructZero(scratch.arena, DataDescriptor<InputType>);
-             desc->m = dims[i];
-             desc->n = dims[i];
-             desc->k = dims[i];
-             f64 ms = Benchmark<InputType, 0, 0>(desc);
+    DataDescriptor<InputType> *desc = PushStructZero(scratch.arena, DataDescriptor<InputType>);
+    desc->m = dims[i];
+    desc->n = dims[i];
+    desc->k = dims[i];
+    f64 ms = Benchmark<InputType, 0, 0>(desc);
 
-             f64 gbps = (1000.0*GetDataTransferSize(desc))/(ms*1000.0*1000.0*1000.0);
-             f64 gflops = (1000.0*GetFLOPS(desc))/(ms*1000.0*1000.0*1000.0);
+    f64 gbps = (1000.0*GetDataTransferSize(desc))/(ms*1000.0*1000.0*1000.0);
+    f64 gflops = (1000.0*GetFLOPS(desc))/(ms*1000.0*1000.0*1000.0);
 
-             // NOTE(achal): snprintf will write the null terminator but its return value will not include it.
-             u32 max_input_label_length = 1023 + 1;
+    // NOTE(achal): snprintf will write the null terminator but its return value will not include it.
+    u32 max_input_label_length = 1023 + 1;
 
-             u8 *input_label = PushArrayZero(scratch.arena, u8, max_input_label_length);
-             u32 label_length = (u32)snprintf((char *)input_label, max_input_label_length, "%ux%ux%u", dims[i], dims[i], dims[i]);
-             Assert(label_length <= max_input_label_length-1);
-             
-             printf("%-20s %-20.6f %-20.6f %-20.6f\n", (char *)input_label, gbps, gflops, ms);
+    u8 *input_label = PushArrayZero(scratch.arena, u8, max_input_label_length);
+    u32 label_length = (u32)snprintf((char *)input_label, max_input_label_length, "%ux%ux%u", dims[i], dims[i], dims[i]);
+    Assert(label_length <= max_input_label_length-1);
+       
+    printf("%-20s %-20.6f %-20.6f %-20.6f\n", (char *)input_label, gbps, gflops, ms);
 
-             if (file)
-             {
-                 fwrite(&label_length, sizeof(u32), 1, file);
-                 fwrite(input_label, sizeof(u8), label_length, file);
+    if(file)
+    {
+     fwrite(&label_length, sizeof(u32), 1, file);
+     fwrite(input_label, sizeof(u8), label_length, file);
 
-                 fwrite(&gbps, sizeof(f64), 1, file);
-                 fwrite(&gflops, sizeof(f64), 1, file);
-                 fwrite(&ms, sizeof(f64), 1, file);
-             }
-             ScratchEnd(&scratch);
-         }
-     }
+     fwrite(&gbps, sizeof(f64), 1, file);
+     fwrite(&gflops, sizeof(f64), 1, file);
+     fwrite(&ms, sizeof(f64), 1, file);
+    }
+    ScratchEnd(&scratch);
+   }
+  }
 
-     if (file)
-         fclose(file);
+  if(file)
+   fclose(file);
  }
 
  EndProfiler();

@@ -49,103 +49,101 @@ template <typename T, u32 block_dim, u32 coarse_factor>
 f64 Benchmark(DataDescriptor<T> *desc)
 {
 #if BUILD_DEBUG
-    printf("Warning: Benchmarking in debug mode. Results will be inaccurate.\n");
+ printf("Warning: Benchmarking in debug mode. Results will be inaccurate.\n");
 #endif
 
-    // Correctness check/warmup
-    b32 correct = 1;
-    {
-        Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
-        Data<T> *data = CreateData<T, block_dim*coarse_factor>(scratch.arena, desc, 0);
+ // Correctness check/warmup
+ b32 correct = 1;
+ {
+  Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
+  Data<T> *data = CreateData<T, block_dim*coarse_factor>(scratch.arena, desc, 0);
+  
+  FunctionToBenchmark<T, block_dim, coarse_factor>(data, 0);
 
-        FunctionToBenchmark<T, block_dim, coarse_factor>(data, 0);
+  if(!ValidateGPUOutput<T>(scratch.arena, data))
+  {
+   // Assert(0);
+   printf("Failed, skipping benchmark\n");
+   correct = 0;
+  }
 
-        if (!ValidateGPUOutput<T>(scratch.arena, data))
-        {
-            // assert(0);
-            printf("Failed, skipping benchmark\n");
-            correct = 0;
-        }
+  DestroyData<T>(data);
+  ScratchEnd(&scratch);
+ }
 
-        DestroyData<T>(data);
-        ScratchEnd(&scratch);
-    }
+ // Benchmark, if correct
+ f64 ms_mean = 0.0;
+ if(correct)
+ {
+  Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
 
-    // Benchmark, if correct
-    f64 ms_mean = 0.0;
-    if (correct)
-    {
-        Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
+  // NOTE(achal): Make sure we are not waiting on the default stream for anything.
+  cudaStream_t stream;
+  CUDACheck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
-        // NOTE(achal): Make sure we are not waiting on the default stream for anything.
-        cudaStream_t stream;
-        CUDACheck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  cudaEvent_t start_event, stop_event;
+  CUDACheck(cudaEventCreate(&start_event));
+  CUDACheck(cudaEventCreate(&stop_event));
 
-        cudaEvent_t start_event, stop_event;
-        CUDACheck(cudaEventCreate(&start_event));
-        CUDACheck(cudaEventCreate(&stop_event));
-
-        int max_reps = 20;
-        int max_benchmarking_ms = 120*1000;
+  int max_reps = 10;
+  int max_benchmarking_ms = 120*1000;
         
-        f64 *duration_ms = PushArrayZero(scratch.arena, f64, max_reps);
+  f64 *duration_ms = PushArrayZero(scratch.arena, f64, max_reps);
 
-        int rep = 0;
-        for (; rep < max_reps; ++rep)
-        {
-            {
-                Scratch data_scratch = ScratchBegin(scratch.arena);
-                Data<T> *data = CreateData<T, block_dim*coarse_factor>(data_scratch.arena, desc, stream);
-                
-                FlushL2Cache();
-                CUDACheck(cudaEventRecord(start_event, stream));
-                FunctionToBenchmark<T, block_dim, coarse_factor>(data, stream);
-                CUDACheck(cudaEventRecord(stop_event, stream));
-                CUDACheck(cudaEventSynchronize(stop_event));
-                
-                DestroyData<T>(data);
-                ScratchEnd(&data_scratch);                   
-            }
-            
-            {
-                f32 temp;
-                CUDACheck(cudaEventElapsedTime(&temp, start_event, stop_event));
-                duration_ms[rep] = (f64)temp;
-            }
+  int rep = 0;
+  for(; rep < max_reps; ++rep)
+  {
+   {
+    Scratch data_scratch = ScratchBegin(scratch.arena);
+    Data<T> *data = CreateData<T, block_dim*coarse_factor>(data_scratch.arena, desc, stream);
+    
+    FlushL2Cache();
+    CUDACheck(cudaEventRecord(start_event, stream));
+    FunctionToBenchmark<T, block_dim, coarse_factor>(data, stream);
+    CUDACheck(cudaEventRecord(stop_event, stream));
+    CUDACheck(cudaEventSynchronize(stop_event));
+    
+    DestroyData<T>(data);
+    ScratchEnd(&data_scratch);                   
+   }
 
-            if (rep > 0)
-            {
-                ms_mean = 0.0;
-                int sample_count = rep + 1;
-                for (int i = 0; i < sample_count; ++i)
-                    ms_mean += duration_ms[i];
-                ms_mean /= sample_count;
+   {
+    f32 temp;
+    CUDACheck(cudaEventElapsedTime(&temp, start_event, stop_event));
+    duration_ms[rep] = (f64)temp;
+   }
 
-                f64 stddev = 0.0;
-                for (int i = 0; i < sample_count; ++i)
-                    stddev += (duration_ms[i] - ms_mean)*(duration_ms[i] - ms_mean);
-                stddev /= rep - 1; // Bessel's correction
-                stddev = sqrt(stddev);
+   if(rep > 0)
+   {
+    ms_mean = 0.0;
+    int sample_count = rep + 1;
+    for(int i = 0; i < sample_count; ++i)
+     ms_mean += duration_ms[i];
+    ms_mean /= sample_count;
 
-                f64 sem = stddev/sqrt(sample_count);
+    f64 stddev = 0.0;
+    for(int i = 0; i < sample_count; ++i)
+     stddev += (duration_ms[i] - ms_mean)*(duration_ms[i] - ms_mean);
+    stddev /= rep - 1; // Bessel's correction
+    stddev = sqrt(stddev);
 
-                // We only exit if any of these is true:
-                // 1) Exceed the maximum number of repeats.
-                // 2) Exceed the maximum benchmarking time.
-                // 3) Sample mean is within 0.01% of population mean i.e. SEM < 0.001.
-                if (sem < 0.001 || rep >= max_reps || ms_mean*sample_count > max_benchmarking_ms)
-                    break;
-            }
-        }
+    f64 sem = stddev/sqrt(sample_count);
 
-        CUDACheck(cudaEventDestroy(stop_event));
-        CUDACheck(cudaEventDestroy(start_event));
-        CUDACheck(cudaStreamDestroy(stream));
+    // We only exit if any of these is true:
+    // 1) Exceed the maximum number of repeats.
+    // 2) Exceed the maximum benchmarking time.
+    // 3) Sample mean is within 0.01% of population mean i.e. SEM < 0.001.
+    if(sem < 0.001 || rep >= max_reps || ms_mean*sample_count > max_benchmarking_ms) break;
+   }
+  }
 
-        ScratchEnd(&scratch);
-    }
+  CUDACheck(cudaEventDestroy(stop_event));
+  CUDACheck(cudaEventDestroy(start_event));
+  CUDACheck(cudaStreamDestroy(stream));
 
-    return ms_mean;
+  ScratchEnd(&scratch);
+ }
+ return ms_mean;
 }
 
 #endif // BENCHMARKING_CU

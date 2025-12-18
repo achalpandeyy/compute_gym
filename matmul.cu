@@ -37,18 +37,18 @@ static void GEMMCPU(u32 m, u32 n, u32 k, T alpha, T *A, T *B, T beta, T *C)
 template <typename T>
 __global__ void GEMMKernel(u32 m, u32 n, u32 k, T alpha, T *A, T *B, T beta, T *C)
 {
-    u32 x = blockIdx.x*blockDim.x + threadIdx.x;
-    u32 y = blockIdx.y*blockDim.y + threadIdx.y;
+ u32 x = blockIdx.x*blockDim.x + threadIdx.x;
+ u32 y = blockIdx.y*blockDim.y + threadIdx.y;
 
-    if (x < n && y < m)
-    {
-        T result(0);
-        for (u32 index = 0; index < k; ++index)
-        {
-            result += A[y*k + index]*B[index*n + x];
-        }
-        C[y*n + x] = alpha*result + beta*C[y*n + x];
-    }
+ if (x < n && y < m)
+ {
+  T result(0);
+  for (u32 index = 0; index < k; ++index)
+  {
+   result += A[y*k + index]*B[index*n + x];
+  }
+  C[y*n + x] = alpha*result + beta*C[y*n + x];
+ }
 }
 
 template <typename T>
@@ -217,7 +217,7 @@ __global__ void GEMMKernel4(u32 M, u32 N, u32 K, half *A, half *B, f32 *C)
     shared_A[tid][i] = A[bidy*(m*k*(K/k)) + tid*(k*(K/k)) + step*(k) + i*(1)];
  
    for(int i = 0; i < 8; ++i)
-    shared_B[tid][i] = B[bidx*(n*k*(K/k)) + i*(k*(K/k)) + step*(k) + tid*(1)];
+    shared_B[tid][i] = B[step*(k*n*(N/n)) + tid*(n*(N/n)) + bidx*(n) + i*(1)];
   }
 
   half tile_a[8];
@@ -239,7 +239,7 @@ __global__ void GEMMKernel4(u32 M, u32 N, u32 K, half *A, half *B, f32 *C)
   u32 *regs_b = (u32 *)tile_b;
   u32 addr_b = __cvta_generic_to_shared(&shared_B[tid % 16][0]);
   asm volatile(
-   "ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
+   "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
    "{%0, %1}, "
    "[%2];"
    : "=r"(regs_b[0]), "=r"(regs_b[1])
@@ -268,6 +268,18 @@ __global__ void GEMMKernel4(u32 M, u32 N, u32 K, half *A, half *B, f32 *C)
 }
 
 template <typename T>
+static void GEMM4(u32 M, u32 N, u32 K, T alpha, T *A, T *B, T beta, f32 *C, cudaStream_t stream)
+{
+ enum {m = 16, n = 8, k = 16};
+ Assert((M%m) == 0);
+ Assert((N%n) == 0);
+ Assert((K%k) == 0);
+  
+ dim3 grid_dim(N/n, M/m, 1);
+ GEMMKernel4<<<grid_dim, 32, 0, stream>>>(M, N, K, A, B, C);
+}
+
+template <typename T>
 struct DataDescriptor
 {
  u32 m, n, k;
@@ -280,7 +292,7 @@ struct Data
 
  T *d_A;
  T *d_B;
- T *d_C;
+ f32 *d_C;
 
  T *h_A;
  T *h_B;
@@ -311,10 +323,24 @@ static Data<T> *CreateData(Arena *arena, DataDescriptor<T> *descriptor, cudaStre
 
  data->h_A = PushArrayZero(arena, T, m*k);
  data->h_B = PushArrayZero(arena, T, k*n);
- std::normal_distribution<T> distribution(0.0, 1.0);
+ std::normal_distribution<f32> distribution(0.f, 1.f);
  std::default_random_engine generator(12345);
- for (u32 i = 0; i < m*k; ++i) data->h_A[i] = distribution(generator);
- for (u32 i = 0; i < k*n; ++i) data->h_B[i] = distribution(generator);
+ for(int r = 0; r < m; ++r) for(int c = 0; c < k; ++c)
+ {
+  f32 v = distribution(generator);
+  if constexpr(std::is_same<T, half>::value)
+   data->h_A[r*k + c] = __float2half(v);
+  else
+   data->h_A[r*k + c] = v;
+ }
+ for(int r = 0; r < k; ++r) for(int c = 0; c < n; ++c)
+ {
+  f32 v = distribution(generator);
+  if constexpr(std::is_same<T, half>::value)
+   data->h_B[r*n + c] = __float2half(v);
+  else
+   data->h_B[r*n + c] = v;
+ }
 
  CUDACheck(cudaMalloc(&data->d_A, m*k*sizeof(*data->d_A)));
  CUDACheck(cudaMalloc(&data->d_B, k*n*sizeof(*data->d_B)));
@@ -338,70 +364,76 @@ static void DestroyData(Data<T> *data)
 template <typename T>
 static b32 ValidateGPUOutput(Arena *arena, Data<T> *data)
 {
-    Scratch scratch = ScratchBegin(arena);
+ Scratch scratch = ScratchBegin(arena);
 
-    u32 m = data->m;
-    u32 n = data->n;
-    u32 k = data->k;
+ u32 m = data->m;
+ u32 n = data->n;
+ u32 k = data->k;
 
-    T *C_gpu = PushArrayZero(scratch.arena, T, m*n);
-    CUDACheck(cudaMemcpy(C_gpu, data->d_C, m*n*sizeof(*C_gpu), cudaMemcpyDeviceToHost));
+ f32 *C_gpu = PushArrayZero(scratch.arena, f32, m*n);
+ CUDACheck(cudaMemcpy(C_gpu, data->d_C, m*n*sizeof(*C_gpu), cudaMemcpyDeviceToHost));
 
-    b32 result = 1;
-    f64 base_tolerance = 1e-2;
-    f64 tolerance = base_tolerance * sqrt(k/64.0); // NOTE(achal): This is a heuristic to scale the tolerance based on the matrix size.
+ b32 result = 1;
+ f64 base_tolerance = 1e-2;
+ f64 tolerance = base_tolerance * sqrt(k/64.0); // NOTE(achal): This is a heuristic to scale the tolerance based on the matrix size.
 
-#if 0
-    T *C_ref = PushArrayZero(scratch.arena, T, m*n);
 #if 1
-    {
-        T *d_C_ref = 0;
-        CUDACheck(cudaMalloc(&d_C_ref, m*n*sizeof(*d_C_ref)));
-        CUDACheck(cudaMemset(d_C_ref, 0, m*n*sizeof(*d_C_ref)));
-        // Assert(data->beta == 0.f);
+ f32 *C_ref = PushArrayZero(scratch.arena, f32, m*n);
+#if 1
+ {
+  f32 *d_C_ref = 0;
+  CUDACheck(cudaMalloc(&d_C_ref, m*n*sizeof(*d_C_ref)));
+  CUDACheck(cudaMemset(d_C_ref, 0, m*n*sizeof(*d_C_ref)));
+  // Assert(data->beta == 0.f);
 
-        // NOTE(achal): cuBLAS, for some reason, uses column-major layout whereas all the matrices are allocated in row-major,
-        // so we are computing C^T = alpha*(B^T@A^T) + beta*C^T
-        // A^T -> kxm
-        // B^T -> nxk
-        // C^T -> nxm
-        // C = alpha*A@B + beta*C
-        // C^T = alpha*(B^T@A^T) + beta*C^T
-        cublasHandle_t handle;
-        cublasCreate(&handle);
-        f32 alpha = 1.f;
-        f32 beta = 0.f;
-        cublasStatus_t status = cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, data->d_B, n, data->d_A, k, &beta, d_C_ref, n);
-        Assert(status == CUBLAS_STATUS_SUCCESS);
-        CUDACheck(cudaDeviceSynchronize());
-        CUDACheck(cudaMemcpy(C_ref, d_C_ref, m*n*sizeof(*C_ref), cudaMemcpyDeviceToHost));
-        CUDACheck(cudaFree(d_C_ref));
-        cublasDestroy(handle);
-    }
+  // NOTE(achal): cuBLAS uses column-major for all matrices whereas they are allocated in row-major via CUDA,
+  // so we are computing C^T = alpha*(B^T@A^T) + beta*C^T
+  // A^T -> kxm
+  // B^T -> nxk
+  // C^T -> nxm
+  // C = alpha*A@B + beta*C
+  // C^T = alpha*(B^T@A^T) + beta*C^T
+  cublasHandle_t handle;
+  cublasCreate(&handle);
+  f32 alpha = 1.f;
+  f32 beta = 0.f;
+  cublasStatus_t status = cublasGemmEx(
+   handle,
+   CUBLAS_OP_N, CUBLAS_OP_N,
+   n, m, k,
+   &alpha,
+   data->d_B, CUDA_R_16F, n,
+   data->d_A, CUDA_R_16F, k,
+   &beta,
+   d_C_ref, CUDA_R_32F, n,
+   CUDA_R_32F,
+   CUBLAS_GEMM_DEFAULT);
+  Assert(status == CUBLAS_STATUS_SUCCESS);
+  CUDACheck(cudaDeviceSynchronize());
+  CUDACheck(cudaMemcpy(C_ref, d_C_ref, m*n*sizeof(*C_ref), cudaMemcpyDeviceToHost));
+  CUDACheck(cudaFree(d_C_ref));
+  cublasDestroy(handle);
+ }
 #else
-    // NOTE(achal): Sometimes checking against cuBLAS just fail randomly, so keep this here as a fallback
-    {
-        GEMMCPU(m, n, k, T(1), data->h_A, data->h_B, T(0), C_ref);
-    }
+ // NOTE(achal): Sometimes checking against cuBLAS just fail randomly, so keep this here as a fallback
+ {
+  GEMMCPU(m, n, k, T(1), data->h_A, data->h_B, T(0), C_ref);
+ }
 #endif
-
-    for (u32 i = 0; i < m*n; ++i)
-    {
-        f64 abs_error = fabsf(C_gpu[i] - C_ref[i]);
-        f64 rel_error = abs_error / (fabsf(C_ref[i]) + 1e-8);
-        if (abs_error > tolerance && rel_error > tolerance)
-        {
-            printf("C_ref[%d] = %f, C_gpu[%d] = %f, abs_error = %f, rel_error = %f\n", i, C_ref[i], i, C_gpu[i], abs_error, rel_error);
-            result = 0;
-            break;
-        }
-    }
-
+ for (u32 i = 0; i < m*n; ++i)
+ {
+  f64 abs_error = fabsf(C_gpu[i] - C_ref[i]);
+  f64 rel_error = abs_error / (fabsf(C_ref[i]) + 1e-8);
+  if (abs_error > tolerance && rel_error > tolerance)
+  {
+   printf("C_ref[%d] = %f, C_gpu[%d] = %f, abs_error = %f, rel_error = %f\n", i, C_ref[i], i, C_gpu[i], abs_error, rel_error);
+   result = 0;
+   break;
+  }
+ }
 #endif
-
-    ScratchEnd(&scratch);
-
-    return result;
+ ScratchEnd(&scratch);
+ return result;
 }
 
 template <typename T, u32 block_dim, u32 coarse_factor>
@@ -409,7 +441,7 @@ static void FunctionToBenchmark(Data<T> *data, cudaStream_t stream)
 {
  // GEMM(data->m, data->n, data->k, T(1), data->d_A, data->d_B, T(0), data->d_C, stream);
  // GEMM2(data->m, data->n, data->k, T(1), data->d_A, data->d_B, T(0), data->d_C, stream);
- GEMM3(data->m, data->n, data->k, T(1), data->d_A, data->d_B, T(0), data->d_C, stream);
+ // GEMM3(data->m, data->n, data->k, T(1), data->d_A, data->d_B, T(0), data->d_C, stream);
 }
 
 template <typename T>
@@ -445,91 +477,37 @@ int main(int argc, char **argv)
   file_name = argv[1];
  }
 
+ using InputType = half;
+ if (1)
  {
   Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
 
-  int M = 32; Assert((M%16) == 0);
-  int K = 32; Assert((K%16) == 0);
-  int N = 16; Assert((N% 8) == 0);
-  
-  enum {m = 16, n = 8, k = 16};
-  static_assert(std::is_trivially_constructible<half>::value);
+  DataDescriptor<InputType> *desc = PushStructZero(scratch.arena, DataDescriptor<InputType>);
+  u32 m = desc->m = 2048; // 15;
+  u32 n = desc->n = 2048; // 17;
+  u32 k = desc->k = 2048; // 16;
 
-  half *h_A = PushArrayZero(scratch.arena, half, M*K);
-  for(int r = 0; r < M; ++r)
+  Data<InputType> *data = CreateData<InputType, 0>(scratch.arena, desc, 0);
+  // GEMM(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
+  // GEMM2(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
+  // GEMM3(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
+  GEMM4<half>(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
+
+  if (!ValidateGPUOutput<InputType>(scratch.arena, data))
   {
-   for(int c = 0; c < K; ++c)
-   {
-    f32 v = (f32)((r/m)*(K/k) + (c/k));
-    h_A[r*K + c] = __float2half(v); // row-major
-   }
+   printf("Failed\n");
+   exit(1);
+  }
+  else
+  {
+   printf("Passed\n");
   }
 
-  half *h_B = PushArrayZero(scratch.arena, half, K*N);
-  for(int r = 0; r < K; ++r)
-  {
-   for(int c = 0; c < N; ++c)
-   {
-    f32 v = (f32)((r/k)*(N/n) + (c/n));
-    h_B[c*K + r] = __float2half(v); // col-major
-   }
-  }
-  
-  half *d_A = 0, *d_B = 0;
-  CUDACheck(cudaMalloc(&d_A, M*K*sizeof(half)));
-  CUDACheck(cudaMemcpy(d_A, h_A, M*K*sizeof(half), cudaMemcpyHostToDevice));
-  CUDACheck(cudaMalloc(&d_B, K*N*sizeof(half)));
-  CUDACheck(cudaMemcpy(d_B, h_B, K*N*sizeof(half), cudaMemcpyHostToDevice));
-
-  f32 *d_C = 0;
-  CUDACheck(cudaMalloc(&d_C, M*N*sizeof(f32)));
-  dim3 grid_dim(N/n, M/m, 1);
-  GEMMKernel4<<<grid_dim, 32>>>(M, N, K, d_A, d_B, d_C);
-
-  // printf("A:\n");
-  // Debug_PrintMatrix(scratch.arena, d_A, M, K, false);
-  // printf("B:\n");
-  // Debug_PrintMatrix(scratch.arena, d_B, K, N);
-
-  CUDACheck(cudaDeviceSynchronize());
-  printf("C:\n");
-  Debug_PrintMatrix(scratch.arena, d_C, M, N, false);
-
+  DestroyData<InputType>(data);
   ScratchEnd(&scratch);
-
-  return 0;
  }
 
- using InputType = f32;
  if (0)
- {
-     Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
-
-     DataDescriptor<InputType> *desc = PushStructZero(scratch.arena, DataDescriptor<InputType>);
-     u32 m = desc->m = 2048; // 15;
-     u32 n = desc->n = 2048; // 17;
-     u32 k = desc->k = 2048; // 16;
-
-     Data<InputType> *data = CreateData<InputType, 0>(scratch.arena, desc, 0);
-     // GEMM(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
-     // GEMM2(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
-     GEMM3(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
-
-     if (!ValidateGPUOutput<InputType>(scratch.arena, data))
-     {
-         printf("Failed\n");
-         exit(1);
-     }
-     else
-     {
-         printf("Passed\n");
-     }
-
-     DestroyData<InputType>(data);
-     ScratchEnd(&scratch);
- }
-
- if (1)
  {
      f64 peak_gbps = 0.0;
      f64 peak_gflops = 0.0;
@@ -589,9 +567,9 @@ int main(int argc, char **argv)
          fclose(file);
  }
 
-    EndProfiler();
-    PrintPerformanceProfile();
+ EndProfiler();
+ PrintPerformanceProfile();
     
-    return 0;
+ return 0;
 }
 PROFILER_END_OF_COMPILATION_UNIT;

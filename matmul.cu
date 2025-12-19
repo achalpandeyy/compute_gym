@@ -201,28 +201,34 @@ __global__ void GEMMKernel4(u32 M, u32 N, u32 K, half *A, half *B, f32 *C)
 {
  enum {m = 16, n = 8, k = 16};
 
- __shared__ alignas(16) half shared_A[m][k];
- __shared__ alignas(16) half shared_B[k][n];
+ __shared__ alignas(16) half shared_A[32][16];
+ __shared__ alignas(16) half shared_B[16][32];
 
  int bidx = blockIdx.x;
  int bidy = blockIdx.y;
- int tid = threadIdx.x;
+ int tx = threadIdx.x;
+ int ty = threadIdx.y;
+ int tid = ty*blockDim.x + tx;
+ int wid = tid/32;
+ int lane_id = tid % 32;
+ int wx = wid % 4;
+ int wy = wid / 4;
 
+ // A: (32, 16, M/32, K/16):(16*(K/16), 1, 32*16*(K/16), 16)
+ // B: (16, 32, K/16, N/32):(32*(N/32), 1, 16*32*(N/32), 32)
+ 
  f32 tile_c[4] = {0.f, 0.f, 0.f, 0.f};
  for(int step = 0; step < K/k; ++step)
  {
-  if(tid < 16)
-  {
-   for(int i = 0; i < 16; ++i)
-    shared_A[tid][i] = A[bidy*(m*k*(K/k)) + tid*(k*(K/k)) + step*(k) + i*(1)];
- 
-   for(int i = 0; i < 8; ++i)
-    shared_B[tid][i] = B[step*(k*n*(N/n)) + tid*(n*(N/n)) + bidx*(n) + i*(1)];
-  }
+  shared_A[ty     ][tx] = A[bidy*(32*16*(K/16)) + (ty     )*(16*(K/16)) + step*(16) + tx*(1)]; // A[ty,      tx, bidy, step]
+  shared_A[ty + 16][tx] = A[bidy*(32*16*(K/16)) + (ty + 16)*(16*(K/16)) + step*(16) + tx*(1)]; // A[ty + 16, tx, bidy, step]
+  shared_B[ty][tx     ] = B[step*(16*32*(N/32)) + ty*(32*(N/32)) + bidx*(32) + (tx     )*(1)]; // B[ty, tx, step, bidx]
+  shared_B[ty][tx + 16] = B[step*(16*32*(N/32)) + ty*(32*(N/32)) + bidx*(32) + (tx + 16)*(1)]; // B[ty, tx + 16, step, bidx]
+  __syncthreads();
 
   half tile_a[8];
+  u32 addr_a = __cvta_generic_to_shared(&shared_A[wy*16 + lane_id % 16][(lane_id / 16)*8]);
   u32 *regs_a = (u32 *)tile_a;
-  u32 addr_a = __cvta_generic_to_shared(&shared_A[tid % 16][(tid / 16)*8]);
   asm volatile(
    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
    "{%0, %1, %2, %3}, "
@@ -236,8 +242,8 @@ __global__ void GEMMKernel4(u32 M, u32 N, u32 K, half *A, half *B, f32 *C)
   // in a way that all the threads end up with the correct values,
   // as expected by mma.
   half tile_b[4];
+  u32 addr_b = __cvta_generic_to_shared(&shared_B[lane_id % 16][wx*8]);
   u32 *regs_b = (u32 *)tile_b;
-  u32 addr_b = __cvta_generic_to_shared(&shared_B[tid % 16][0]);
   asm volatile(
    "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
    "{%0, %1}, "
@@ -258,13 +264,11 @@ __global__ void GEMMKernel4(u32 M, u32 N, u32 K, half *A, half *B, f32 *C)
   );
  }
 
- int group_id = tid >> 2;
- for(int i = 0; i < ArrayCount(tile_c); ++i)
- {
-  int row = group_id + (i/2)*8;
-  int col = 2*(tid % 4) + (i % 2);
-  C[bidy*(m*(N/n)*n) + row*((N/n)*n) + bidx*(n) + col*(1)] = tile_c[i];
- }
+ // C = (16, 8, 32/16, 32/8, M/32, N/32):(8*(32/8)*(N/32), 1, 16*8*(32/8)*(N/32), 8, (32/16)*16*8*(32/8)*(N/32), 8*(32/8))
+ C[bidy*((32/16)*16*8*(32/8)*(N/32)) + wy*(16*8*(32/8)*(N/32)) + (lane_id/4    )*(8*(32/8)*(N/32)) + bidx*(8*(32/8)) + wx*(8) + (2*(lane_id % 4)    )*(1)] = tile_c[0];
+ C[bidy*((32/16)*16*8*(32/8)*(N/32)) + wy*(16*8*(32/8)*(N/32)) + (lane_id/4    )*(8*(32/8)*(N/32)) + bidx*(8*(32/8)) + wx*(8) + (2*(lane_id % 4) + 1)*(1)] = tile_c[1];
+ C[bidy*((32/16)*16*8*(32/8)*(N/32)) + wy*(16*8*(32/8)*(N/32)) + (lane_id/4 + 8)*(8*(32/8)*(N/32)) + bidx*(8*(32/8)) + wx*(8) + (2*(lane_id % 4)    )*(1)] = tile_c[2];
+ C[bidy*((32/16)*16*8*(32/8)*(N/32)) + wy*(16*8*(32/8)*(N/32)) + (lane_id/4 + 8)*(8*(32/8)*(N/32)) + bidx*(8*(32/8)) + wx*(8) + (2*(lane_id % 4) + 1)*(1)] = tile_c[3];
 }
 
 template <typename T>
@@ -274,9 +278,17 @@ static void GEMM4(u32 M, u32 N, u32 K, T alpha, T *A, T *B, T beta, f32 *C, cuda
  Assert((M%m) == 0);
  Assert((N%n) == 0);
  Assert((K%k) == 0);
-  
- dim3 grid_dim(N/n, M/m, 1);
- GEMMKernel4<<<grid_dim, 32, 0, stream>>>(M, N, K, A, B, C);
+
+ dim3 block_dim(16, 16, 1);
+ dim3 warps(4, 2, 1);
+ Assert(block_dim.x*block_dim.y == warps.x*warps.y*32);
+
+ dim3 tile_dim(warps.x*n, warps.y*m, 1);
+ Assert((M % tile_dim.y) == 0);
+ Assert((N % tile_dim.x) == 0);
+ Assert((K % k) == 0);
+ dim3 grid_dim(N/tile_dim.x, M/tile_dim.y, 1);
+ GEMMKernel4<<<grid_dim, block_dim, 0, stream>>>(M, N, K, A, B, C);
 }
 
 template <typename T>
@@ -479,14 +491,14 @@ int main(int argc, char **argv)
  }
 
  using InputType = half;
- if(0)
+ if(1)
  {
   Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
 
   DataDescriptor<InputType> *desc = PushStructZero(scratch.arena, DataDescriptor<InputType>);
-  u32 m = desc->m = 4096; // 15;
-  u32 n = desc->n = 4096; // 17;
-  u32 k = desc->k = 4096; // 16;
+  u32 m = desc->m = 4096;
+  u32 n = desc->n = 4096;
+  u32 k = desc->k = 32;
 
   Data<InputType> *data = CreateData<InputType, 0>(scratch.arena, desc, 0);
   // GEMM(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
@@ -508,7 +520,7 @@ int main(int argc, char **argv)
   ScratchEnd(&scratch);
  }
 
- if(1)
+ if(0)
  {
   f64 peak_gbps = 0.0;
   f64 peak_gflops = 0.0;

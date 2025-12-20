@@ -262,6 +262,7 @@ __global__ void GEMMKernel4(u32 M, u32 N, u32 K, half *A, half *B, f32 *C)
    : "r"(regs_a[0]),  "r"(regs_a[1]),  "r"(regs_a[2]),  "r"(regs_a[3]), 
      "r"(regs_b[0]),  "r"(regs_b[1])
   );
+  __syncthreads();
  }
 
  // C = (16, 8, 32/16, 32/8, M/32, N/32):(8*(32/8)*(N/32), 1, 16*8*(32/8)*(N/32), 8, (32/16)*16*8*(32/8)*(N/32), 8*(32/8))
@@ -491,14 +492,14 @@ int main(int argc, char **argv)
  }
 
  using InputType = half;
- if(1)
+ if(0)
  {
   Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
 
   DataDescriptor<InputType> *desc = PushStructZero(scratch.arena, DataDescriptor<InputType>);
   u32 m = desc->m = 4096;
   u32 n = desc->n = 4096;
-  u32 k = desc->k = 32;
+  u32 k = desc->k = 4096;
 
   Data<InputType> *data = CreateData<InputType, 0>(scratch.arena, desc, 0);
   // GEMM(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
@@ -520,7 +521,7 @@ int main(int argc, char **argv)
   ScratchEnd(&scratch);
  }
 
- if(0)
+ if(1)
  {
   f64 peak_gbps = 0.0;
   f64 peak_gflops = 0.0;

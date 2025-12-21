@@ -197,7 +197,48 @@ static void GEMM3(u32 m, u32 n, u32 k, T alpha, T *A, T *B, T beta, T *C, cudaSt
     GEMMKernel3<T, tile_dim, elements_per_thread><<<grid_dim, block_dim, 0, stream>>>(m, n, k, alpha, A, B, beta, C);
 }
 
-__global__ void GEMMKernel4(u32 M, u32 N, u32 K, half *A, half *B, f32 *C)
+template<int... dims>
+struct Layout
+{
+ static constexpr int shape[sizeof...(dims)] = {dims...};
+ template<typename... Args> __device__ int operator()(Args... args)
+ {
+  if constexpr(sizeof...(args) == 4)
+  {
+   int stride[4];
+   stride[1] = 1;
+   stride[3] = shape[1]*stride[1];
+   stride[0] = shape[3]*stride[3];
+   stride[2] = shape[0]*stride[0];
+
+   int is[] = {args...};
+   int index = is[0]*stride[0] + is[1]*stride[1] + is[2]*stride[2] + is[3]*stride[3];
+   return index;
+  }
+  else if constexpr(sizeof...(args) == 6)
+  {
+   int stride[6] = {};
+   stride[1] = 1;
+   stride[3] = shape[1]*stride[1];
+   stride[5] = shape[3]*stride[3];
+   stride[0] = shape[5]*stride[5];
+   stride[2] = shape[0]*stride[0];
+   stride[4] = shape[2]*stride[2];
+
+   int is[] = {args...};
+   int index = is[0]*stride[0] + is[1]*stride[1] + is[2]*stride[2] + is[3]*stride[3] + is[4]*stride[4] + is[5]*stride[5];
+   return index;
+  }
+  else
+  {
+   static_assert(false, "Incorrect number of dimensions specified");
+  }
+  return 0;
+ }
+};
+
+template<int M, int N, int K>
+__global__ void GEMMKernel4(half *A, half *B, f32 *C)
 {
  enum {m = 16, n = 8, k = 16};
 
@@ -214,16 +255,16 @@ __global__ void GEMMKernel4(u32 M, u32 N, u32 K, half *A, half *B, f32 *C)
  int wx = wid % 4;
  int wy = wid / 4;
 
- // A: (32, 16, M/32, K/16):(16*(K/16), 1, 32*16*(K/16), 16)
- // B: (16, 32, K/16, N/32):(32*(N/32), 1, 16*32*(N/32), 32)
+ Layout<32, 16, M/32, K/16> laya;
+ Layout<16, 32, K/16, N/32> layb;
  
  f32 tile_c[4] = {0.f, 0.f, 0.f, 0.f};
  for(int step = 0; step < K/k; ++step)
  {
-  shared_A[ty     ][tx] = A[bidy*(32*16*(K/16)) + (ty     )*(16*(K/16)) + step*(16) + tx*(1)]; // A[ty,      tx, bidy, step]
-  shared_A[ty + 16][tx] = A[bidy*(32*16*(K/16)) + (ty + 16)*(16*(K/16)) + step*(16) + tx*(1)]; // A[ty + 16, tx, bidy, step]
-  shared_B[ty][tx     ] = B[step*(16*32*(N/32)) + ty*(32*(N/32)) + bidx*(32) + (tx     )*(1)]; // B[ty, tx, step, bidx]
-  shared_B[ty][tx + 16] = B[step*(16*32*(N/32)) + ty*(32*(N/32)) + bidx*(32) + (tx + 16)*(1)]; // B[ty, tx + 16, step, bidx]
+  shared_A[ty     ][tx] = A[laya(ty     , tx     , bidy, step)];
+  shared_A[ty + 16][tx] = A[laya(ty + 16, tx     , bidy, step)];
+  shared_B[ty][tx     ] = B[layb(ty     , tx     , step, bidx)];
+  shared_B[ty][tx + 16] = B[layb(ty     , tx + 16, step, bidx)];
   __syncthreads();
 
   half tile_a[8];
@@ -265,15 +306,16 @@ __global__ void GEMMKernel4(u32 M, u32 N, u32 K, half *A, half *B, f32 *C)
   __syncthreads();
  }
 
- // C = (16, 8, 32/16, 32/8, M/32, N/32):(8*(32/8)*(N/32), 1, 16*8*(32/8)*(N/32), 8, (32/16)*16*8*(32/8)*(N/32), 8*(32/8))
- C[bidy*((32/16)*16*8*(32/8)*(N/32)) + wy*(16*8*(32/8)*(N/32)) + (lane_id/4    )*(8*(32/8)*(N/32)) + bidx*(8*(32/8)) + wx*(8) + (2*(lane_id % 4)    )*(1)] = tile_c[0];
- C[bidy*((32/16)*16*8*(32/8)*(N/32)) + wy*(16*8*(32/8)*(N/32)) + (lane_id/4    )*(8*(32/8)*(N/32)) + bidx*(8*(32/8)) + wx*(8) + (2*(lane_id % 4) + 1)*(1)] = tile_c[1];
- C[bidy*((32/16)*16*8*(32/8)*(N/32)) + wy*(16*8*(32/8)*(N/32)) + (lane_id/4 + 8)*(8*(32/8)*(N/32)) + bidx*(8*(32/8)) + wx*(8) + (2*(lane_id % 4)    )*(1)] = tile_c[2];
- C[bidy*((32/16)*16*8*(32/8)*(N/32)) + wy*(16*8*(32/8)*(N/32)) + (lane_id/4 + 8)*(8*(32/8)*(N/32)) + bidx*(8*(32/8)) + wx*(8) + (2*(lane_id % 4) + 1)*(1)] = tile_c[3];
+ Layout<16, 8, 32/16, 32/8, M/32, N/32> layc;
+
+ C[layc((lane_id/4    ), (2*(lane_id % 4)    ), wy, wx, bidy, bidx)] = tile_c[0];
+ C[layc((lane_id/4    ), (2*(lane_id % 4) + 1), wy, wx, bidy, bidx)] = tile_c[1];
+ C[layc((lane_id/4 + 8), (2*(lane_id % 4)    ), wy, wx, bidy, bidx)] = tile_c[2];
+ C[layc((lane_id/4 + 8), (2*(lane_id % 4) + 1), wy, wx, bidy, bidx)] = tile_c[3];
 }
 
-template <typename T>
-static void GEMM4(u32 M, u32 N, u32 K, T alpha, T *A, T *B, T beta, f32 *C, cudaStream_t stream)
+template<typename T>
+static void GEMM4(int M, int N, int K, T alpha, T *A, T *B, T beta, f32 *C, cudaStream_t stream)
 {
  enum {m = 16, n = 8, k = 16};
  Assert((M%m) == 0);
@@ -289,7 +331,19 @@ static void GEMM4(u32 M, u32 N, u32 K, T alpha, T *A, T *B, T beta, f32 *C, cuda
  Assert((N % tile_dim.x) == 0);
  Assert((K % k) == 0);
  dim3 grid_dim(N/tile_dim.x, M/tile_dim.y, 1);
- GEMMKernel4<<<grid_dim, block_dim, 0, stream>>>(M, N, K, A, B, C);
+
+ if(M==4096 && N==4096 && K==4096)
+ {
+  GEMMKernel4<4096, 4096, 4096><<<grid_dim, block_dim, 0, stream>>>(A, B, C);
+ }
+ else if(M==64 && N==64 && K==16)
+ {
+  GEMMKernel4<64, 64, 16><<<grid_dim, block_dim, 0, stream>>>(A, B, C);
+ }
+ else
+ {
+  Assert("Invalid code path");
+ }
 }
 
 template <typename T>
@@ -433,6 +487,7 @@ static b32 ValidateGPUOutput(Arena *arena, Data<T> *data)
   GEMMCPU(m, n, k, T(1), data->h_A, data->h_B, T(0), C_ref);
  }
 #endif
+#if 1
  for (u32 i = 0; i < m*n; ++i)
  {
   f64 abs_error = fabsf(C_gpu[i] - C_ref[i]);
@@ -444,6 +499,7 @@ static b32 ValidateGPUOutput(Arena *arena, Data<T> *data)
    break;
   }
  }
+#endif
 #endif
  ScratchEnd(&scratch);
  return result;
@@ -492,7 +548,7 @@ int main(int argc, char **argv)
  }
 
  using InputType = half;
- if(0)
+ if(1)
  {
   Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
 
@@ -505,23 +561,25 @@ int main(int argc, char **argv)
   // GEMM(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
   // GEMM2(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
   // GEMM3(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
-  GEMM4<half>(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
-
-  if (!ValidateGPUOutput<InputType>(scratch.arena, data))
+  // for(int _ = 0; _ < 50 + 5; ++_)
   {
-   printf("Failed\n");
-   exit(1);
-  }
-  else
-  {
-   printf("Passed\n");
+   GEMM4<half>(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
+   if (!ValidateGPUOutput<InputType>(scratch.arena, data))
+   {
+    printf("Failed\n");
+    exit(1);
+   }
+   else
+   {
+    printf("Passed\n");
+   }
   }
 
   DestroyData<InputType>(data);
   ScratchEnd(&scratch);
  }
 
- if(1)
+ if(0)
  {
   f64 peak_gbps = 0.0;
   f64 peak_gflops = 0.0;

@@ -15,23 +15,23 @@
 #include <random>
 #include <cublas_v2.h>
 
-template <typename T>
-static void GEMMCPU(u32 m, u32 n, u32 k, T alpha, T *A, T *B, T beta, T *C)
+
+static void GEMMCPU(int M, int N, int K, half alpha, half *A, half *B, half beta, float *C)
 {
-    PROFILE_SCOPE_BEGIN("GEMMCPU");
-    for (u32 y = 0; y < m; ++y)
-    {
-        for (u32 x = 0; x < n; ++x)
-        {
-            T result(0);
-            for (u32 index = 0; index < k; ++index)
-            {
-                result += A[y*k + index]*B[index*n + x];
-            }
-            C[y*n + x] = alpha*result + beta*C[y*n + x];
-        }
-    }
-    PROFILE_SCOPE_END();
+ PROFILE_SCOPE_BEGIN("GEMMCPU");
+ for(int row = 0; row < M; ++row)
+ {
+  for(int col = 0; col < N; ++col)
+  {
+   float result = 0.f;
+   for(int index = 0; index < K; ++index)
+   {
+    result += __half2float(A[row*K + index])*__half2float(B[index*N + col]);
+   }
+   C[row*N + col] = __half2float(alpha)*result + __half2float(beta)*C[row*N + col];
+  }
+ }
+ PROFILE_SCOPE_END();
 }
 
 template <typename T>
@@ -203,7 +203,17 @@ struct Layout
  static constexpr int shape[sizeof...(dims)] = {dims...};
  template<typename... Args> __device__ int operator()(Args... args)
  {
-  if constexpr(sizeof...(args) == 4)
+  if constexpr(sizeof...(args) == 2)
+  {
+   int stride[2];
+   stride[1] = 1;
+   stride[0] = shape[1]*stride[1];
+
+   int is[] = {args...};
+   int index = is[0]*stride[0] + is[1]*stride[1];
+   return index;
+  }
+  else if constexpr(sizeof...(args) == 4)
   {
    int stride[4];
    stride[1] = 1;
@@ -229,6 +239,21 @@ struct Layout
    int index = is[0]*stride[0] + is[1]*stride[1] + is[2]*stride[2] + is[3]*stride[3] + is[4]*stride[4] + is[5]*stride[5];
    return index;
   }
+  else if constexpr(sizeof...(args) == 8)
+  {
+   int stride[8] = {};
+   stride[1] = 1;
+   stride[3] = shape[1]*stride[1];
+   stride[5] = shape[3]*stride[3];
+   stride[7] = shape[5]*stride[5];
+   stride[0] = shape[7]*stride[7];
+   stride[2] = shape[0]*stride[0];
+   stride[4] = shape[2]*stride[2];
+   stride[6] = shape[4]*stride[4];
+   int is[] = {args...};
+   int index = is[0]*stride[0] + is[1]*stride[1] + is[2]*stride[2] + is[3]*stride[3] + is[4]*stride[4] + is[5]*stride[5] * is[6]*stride[6] + is[7]*stride[7];
+   return index;
+  }
   else
   {
    static_assert(false, "Incorrect number of dimensions specified");
@@ -237,13 +262,15 @@ struct Layout
  }
 };
 
+__device__ u8 *g_debug_buffer;
+
 template<int M, int N, int K>
 __global__ void GEMMKernel4(half *A, half *B, f32 *C)
 {
  enum {m = 16, n = 8, k = 16};
 
- __shared__ alignas(16) half shared_A[32][16];
- __shared__ alignas(16) half shared_B[16][32];
+ __shared__ alignas(16) half shared_A[2*32*16];
+ __shared__ alignas(16) half shared_B[16*2*32];
 
  int bidx = blockIdx.x;
  int bidy = blockIdx.y;
@@ -255,63 +282,85 @@ __global__ void GEMMKernel4(half *A, half *B, f32 *C)
  int wx = wid % 4;
  int wy = wid / 4;
 
- Layout<32, 16, M/32, K/16> laya;
- Layout<16, 32, K/16, N/32> layb;
- 
- f32 tile_c[4] = {0.f, 0.f, 0.f, 0.f};
+ Layout<64, 16, M/64, K/16> lay_a;
+ Layout<16, 64, K/16, N/64> lay_b;
+
+ Layout<64, 16> lay_sh_a_write;
+ Layout<16, 64> lay_sh_b_write;
+ Layout<1, 8, 64/1, 16/8> lay_sh_a_read;
+ Layout<1, 8, 16/1, 64/8> lay_sh_b_read;
+ f32 tile_c[2][2][4] = {0.f,};
  for(int step = 0; step < K/k; ++step)
  {
-  shared_A[ty     ][tx] = A[laya(ty     , tx     , bidy, step)];
-  shared_A[ty + 16][tx] = A[laya(ty + 16, tx     , bidy, step)];
-  shared_B[ty][tx     ] = B[layb(ty     , tx     , step, bidx)];
-  shared_B[ty][tx + 16] = B[layb(ty     , tx + 16, step, bidx)];
+  // TODO(achal): It will be easier to read if I can separate this into two nested for loops for iwx and iwy
+  for(int iw = 0; iw < 4; ++iw)
+  {
+   shared_A[lay_sh_a_write(ty + iw*16, tx)] = A[lay_a(ty + iw*16, tx, bidy, step)];
+   shared_B[lay_sh_b_write(ty, tx + iw*16)] = B[lay_b(ty, tx + iw*16, step, bidx)];
+  }
   __syncthreads();
 
-  half tile_a[8];
-  u32 addr_a = __cvta_generic_to_shared(&shared_A[wy*16 + lane_id % 16][(lane_id / 16)*8]);
-  u32 *regs_a = (u32 *)tile_a;
-  asm volatile(
-   "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
-   "{%0, %1, %2, %3}, "
-   "[%4];"
-   : "=r"(regs_a[0]), "=r"(regs_a[1]), "=r"(regs_a[2]), "=r"(regs_a[3])
-   : "r"(addr_a)
-  );
+  for(int iwy = 0; iwy < 2; ++iwy)
+  {
+   half tile_a[8];
+   u32 addr_a = __cvta_generic_to_shared(&shared_A[lay_sh_a_read(0, 0, wy*16 + 32*iwy + (lane_id % 16), lane_id / 16)]);
+   u32 *regs_a = (u32 *)tile_a;
+   asm volatile(
+    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+    "{%0, %1, %2, %3}, "
+    "[%4];"
+    : "=r"(regs_a[0]), "=r"(regs_a[1]), "=r"(regs_a[2]), "=r"(regs_a[3])
+    : "r"(addr_a)
+   );
+   for(int iwx = 0; iwx < 2; ++iwx)
+   {
+    // Even though the last sixteen threads, in the warp, have the
+    // same smem address as the first sixteen, the instruction works
+    // in a way that all the threads end up with the correct values,
+    // as expected by mma.
+    half tile_b[4];
+    u32 addr_b = __cvta_generic_to_shared(&shared_B[lay_sh_b_read(0, 0, lane_id % 16, wx + 4*iwx)]);
+    u32 *regs_b = (u32 *)tile_b;
+    asm volatile(
+     "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
+     "{%0, %1}, "
+     "[%2];"
+     : "=r"(regs_b[0]), "=r"(regs_b[1])
+     : "r"(addr_b)
+    );
 
-  // Even though the last sixteen threads, in the warp, have the
-  // same smem address as the first sixteen, the instruction works
-  // in a way that all the threads end up with the correct values,
-  // as expected by mma.
-  half tile_b[4];
-  u32 addr_b = __cvta_generic_to_shared(&shared_B[lane_id % 16][wx*8]);
-  u32 *regs_b = (u32 *)tile_b;
-  asm volatile(
-   "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
-   "{%0, %1}, "
-   "[%2];"
-   : "=r"(regs_b[0]), "=r"(regs_b[1])
-   : "r"(addr_b)
-  );
-
-  asm volatile(
-   "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-   "{%0, %1, %2, %3}, " // d
-   "{%4, %5, %6, %7}, " // a
-   "{%8, %9}, " // b
-   "{%0, %1, %2, %3};\n" // c
-   : "+f"(tile_c[0]), "+f"(tile_c[1]), "+f"(tile_c[2]), "+f"(tile_c[3])
-   : "r"(regs_a[0]),  "r"(regs_a[1]),  "r"(regs_a[2]),  "r"(regs_a[3]), 
-     "r"(regs_b[0]),  "r"(regs_b[1])
-  );
+    asm volatile(
+     "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+     "{%0, %1, %2, %3}, " // d
+     "{%4, %5, %6, %7}, " // a
+     "{%8, %9}, " // b
+     "{%0, %1, %2, %3};\n" // c
+     : "+f"(tile_c[iwy][iwx][0]), "+f"(tile_c[iwy][iwx][1]), "+f"(tile_c[iwy][iwx][2]), "+f"(tile_c[iwy][iwx][3])
+     : "r"(regs_a[0]),  "r"(regs_a[1]),  "r"(regs_a[2]),  "r"(regs_a[3]), 
+       "r"(regs_b[0]),  "r"(regs_b[1])
+    );
+  }
+ }
   __syncthreads();
  }
 
- Layout<16, 8, 32/16, 32/8, M/32, N/32> layc;
+ // TODO(achal): Ideally there should be a way to split the layout like this:
+ // Layout<64, 64, M/64, N/64>
+ // Layout<32, 32, 64/32, 64/32>
+ // Layout<16, 8, 32/16, 32/8>
+ for(int iwy = 0; iwy < 2; ++iwy)
+ {
+  for(int iwx = 0; iwx < 2; ++iwx)
+  {
+   int base_row = bidy*64 + iwy*32 + wy*16;
+   int base_col = bidx*64 + iwx*32 + wx*8;
 
- C[layc((lane_id/4    ), (2*(lane_id % 4)    ), wy, wx, bidy, bidx)] = tile_c[0];
- C[layc((lane_id/4    ), (2*(lane_id % 4) + 1), wy, wx, bidy, bidx)] = tile_c[1];
- C[layc((lane_id/4 + 8), (2*(lane_id % 4)    ), wy, wx, bidy, bidx)] = tile_c[2];
- C[layc((lane_id/4 + 8), (2*(lane_id % 4) + 1), wy, wx, bidy, bidx)] = tile_c[3];
+   C[(base_row + (lane_id/4    ))*N + (base_col + (2*(lane_id % 4)    ))] = tile_c[iwy][iwx][0];
+   C[(base_row + (lane_id/4    ))*N + (base_col + (2*(lane_id % 4) + 1))] = tile_c[iwy][iwx][1];
+   C[(base_row + (lane_id/4 + 8))*N + (base_col + (2*(lane_id % 4)    ))] = tile_c[iwy][iwx][2];
+   C[(base_row + (lane_id/4 + 8))*N + (base_col + (2*(lane_id % 4) + 1))] = tile_c[iwy][iwx][3];
+  }
+ }
 }
 
 template<typename T>
@@ -326,7 +375,7 @@ static void GEMM4(int M, int N, int K, T alpha, T *A, T *B, T beta, f32 *C, cuda
  dim3 warps(4, 2, 1);
  Assert(block_dim.x*block_dim.y == warps.x*warps.y*32);
 
- dim3 tile_dim(warps.x*n, warps.y*m, 1);
+ dim3 tile_dim(2*warps.x*n, 2*warps.y*m, 1);
  Assert((M % tile_dim.y) == 0);
  Assert((N % tile_dim.x) == 0);
  Assert((K % k) == 0);
@@ -336,13 +385,13 @@ static void GEMM4(int M, int N, int K, T alpha, T *A, T *B, T beta, f32 *C, cuda
  {
   GEMMKernel4<4096, 4096, 4096><<<grid_dim, block_dim, 0, stream>>>(A, B, C);
  }
- else if(M==64 && N==64 && K==16)
+ else if(M==64 && N==64 && K==64)
  {
-  GEMMKernel4<64, 64, 16><<<grid_dim, block_dim, 0, stream>>>(A, B, C);
+  GEMMKernel4<64, 64, 64><<<grid_dim, block_dim, 0, stream>>>(A, B, C);
  }
  else
  {
-  Assert("Invalid code path");
+  Assert(!"Invalid code path");
  }
 }
 
@@ -444,7 +493,7 @@ static b32 ValidateGPUOutput(Arena *arena, Data<T> *data)
  f64 base_tolerance = 1e-2;
  f64 tolerance = base_tolerance * sqrt(k/64.0); // NOTE(achal): This is a heuristic to scale the tolerance based on the matrix size.
 
-#if 1
+#if 0
  f32 *C_ref = PushArrayZero(scratch.arena, f32, m*n);
 #if 1
  {
@@ -487,7 +536,7 @@ static b32 ValidateGPUOutput(Arena *arena, Data<T> *data)
   GEMMCPU(m, n, k, T(1), data->h_A, data->h_B, T(0), C_ref);
  }
 #endif
-#if 1
+#if 0
  for (u32 i = 0; i < m*n; ++i)
  {
   f64 abs_error = fabsf(C_gpu[i] - C_ref[i]);
@@ -528,7 +577,7 @@ static void Debug_PrintMatrix(Arena *arena, T *matrix, u32 m, u32 n, bool col_ma
   {
    int index = col_major ? (c*m + r) : (r*n + c);
    if constexpr (std::is_floating_point<T>::value)
-    printf("%10.6f ", h_matrix[index]);
+    printf("%2.2f ", h_matrix[index]);
    else
     printf("%2d ", (u16)h_matrix[index]);
   }
@@ -542,7 +591,7 @@ int main(int argc, char **argv)
  BeginProfiler();
 
  char *file_name = 0;
- if (argc == 2)
+ if(argc == 2)
  {
   file_name = argv[1];
  }
@@ -550,6 +599,12 @@ int main(int argc, char **argv)
  using InputType = half;
  if(1)
  {
+  u8 *d_debug_buffer = 0;
+  {
+   CUDACheck(cudaMalloc(&d_debug_buffer, MegaBytes(1)));
+   CUDACheck(cudaMemcpyToSymbol(g_debug_buffer, &d_debug_buffer, sizeof(g_debug_buffer), 0, cudaMemcpyHostToDevice));
+  }
+
   Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
 
   DataDescriptor<InputType> *desc = PushStructZero(scratch.arena, DataDescriptor<InputType>);
@@ -561,19 +616,34 @@ int main(int argc, char **argv)
   // GEMM(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
   // GEMM2(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
   // GEMM3(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
-  // for(int _ = 0; _ < 50 + 5; ++_)
+  for(int _ = 0; _ < 50 + 5; ++_)
   {
    GEMM4<half>(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
    if (!ValidateGPUOutput<InputType>(scratch.arena, data))
    {
     printf("Failed\n");
-    exit(1);
    }
    else
    {
     printf("Passed\n");
    }
   }
+
+  CUDACheck(cudaDeviceSynchronize());
+  u8 *h_debug_buffer = PushBytes(scratch.arena, MegaBytes(1));
+  CUDACheck(cudaMemcpy(h_debug_buffer, d_debug_buffer, MegaBytes(1), cudaMemcpyDeviceToHost));
+
+  FILE *debug_file = fopen("debug.bin", "wb");
+  if(debug_file)
+  {
+   size_t size = fwrite(h_debug_buffer, 1, MegaBytes(1), debug_file);
+   if(size != MegaBytes(1)) printf("Debug buffer write incomplete (%llu/%llu)\n", size, MegaBytes(1));
+  }
+  else
+  {
+   printf("Failed to write debug buffer\n");
+  }
+  fclose(debug_file);
 
   DestroyData<InputType>(data);
   ScratchEnd(&scratch);

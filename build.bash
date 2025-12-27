@@ -26,7 +26,9 @@ virtual_arch="compute_89"
 real_arch="sm_89"
 
 # NOTE(achal): Defining macros for NVCC defines them for the host side as well.
-nvcc_common="nvcc.exe -keep -lineinfo -I ../../../cccl/ -I ../../../cccl/libcudacxx/include -I ../../../cccl/cub -I ../../../cccl/thrust --use-local-env -std=c++17 --generate-code=arch=${virtual_arch},code=[${real_arch},${virtual_arch}] --diag-suppress 186 --ptxas-options=-v -Xcompiler \"$host_compile\""
+# NOTE(achal): -keep to keep the intermediate files (including PTX) in the build directory.
+# NOTE(achal): --ptxas-options=-v
+nvcc_common="nvcc.exe -lineinfo -I ../../../cccl/ -I ../../../cccl/libcudacxx/include -I ../../../cccl/cub -I ../../../cccl/thrust --use-local-env -std=c++17 --generate-code=arch=${virtual_arch},code=[${real_arch},${virtual_arch}] --diag-suppress 186 -Xcompiler \"$host_compile\""
 nvcc_debug="$nvcc_common -O0"
 nvcc_release="$nvcc_common -O3"
 

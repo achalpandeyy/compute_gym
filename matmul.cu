@@ -58,65 +58,49 @@ static void GEMM(int M, int N, int K, half alpha, half *A, half *B, half beta, f
  GEMMKernel<<<grid, block, 0, stream>>>(M, N, K, alpha, A, B, beta, C);
 }
 
-template <u32 tile_dim>
-__global__ void GEMMKernel2(u32 m, u32 n, u32 k, half alpha, half *A, half *B, half beta, f32 *C)
+__global__ void GEMMKernel2(int M, int N, int K, half alpha, half *A, half *B, half beta, float *C)
 {
+ enum { tile_dim = 32 };
  __shared__ half tile_A[tile_dim][tile_dim];
  __shared__ half tile_B[tile_dim][tile_dim];
 
- // one block computes one output tile
- u32 tile_x = blockIdx.x;
- u32 tile_y = blockIdx.y;
+ int bidm = blockIdx.y;
+ int bidn = blockIdx.x;
+ int tm = threadIdx.y;
+ int tn = threadIdx.x;
 
- u32 tx = threadIdx.x;
- u32 ty = threadIdx.y;
-
- f32 result = 0.f;
- u32 step_count = (k + tile_dim - 1)/tile_dim;
- for(u32 step_index = 0; step_index < step_count; ++step_index)
+ float result = 0.f;
+ for(int step = 0; step < K/tile_dim; ++step)
  {
-  // (tile_x, tile_y) -> tile_A
-  u32 ax = step_index*tile_dim + tx;
-  u32 ay = tile_y*tile_dim + ty;
+  int row = bidm*tile_dim + tm;
+  int col = step*tile_dim + tn;
+  tile_A[tm][tn] = A[row*K + col];
 
-  half a(0);
-  if(ax < k && ay < m)
-   a = A[ay*k + ax];
-
-  // (tile_x, tile_y) -> tile_B
-  u32 bx = tile_x*tile_dim + tx;
-  u32 by = step_index*tile_dim + ty;
-
-  half b(0); // KxN
-  if(bx < n && by < k)
-   b = B[by*n + bx];
-     
-  tile_A[ty][tx] = a;
-  tile_B[ty][tx] = b;
+  row = step*tile_dim + tm;
+  col = bidn*tile_dim + tn;
+  tile_B[tm][tn] = B[row*N + col];
   __syncthreads();
      
-  for(int index = 0; index < tile_dim; ++index)
-  {
-   result += __half2float(tile_A[ty][index])*__half2float(tile_B[index][tx]);
-  }
+  for(int k = 0; k < tile_dim; ++k)
+   result += __half2float(tile_A[tm][k])*__half2float(tile_B[k][tn]);
+
   __syncthreads();
  }
 
- u32 col = tile_x*tile_dim + tx;
- u32 row = tile_y*tile_dim + ty;
-
- if (row < m && col < n)
- {
-  C[row*n + col] = __half2float(alpha)*result + __half2float(beta)*C[row*n + col];
- }
+ int row = bidm*tile_dim + tm;
+ int col = bidn*tile_dim + tn;
+ C[row*N + col] = __half2float(alpha)*result + __half2float(beta)*C[row*N + col];
 }
 
-static void GEMM2(u32 m, u32 n, u32 k, half alpha, half *A, half *B, half beta, f32 *C, cudaStream_t stream)
+static void GEMM2(int m, int n, int k, half alpha, half *A, half *B, half beta, float *C, cudaStream_t stream)
 {
  enum { tile_dim = 32 };
  dim3 block(tile_dim, tile_dim, 1);
- dim3 grid((n + tile_dim - 1)/tile_dim, (m + tile_dim - 1)/tile_dim, 1);
- GEMMKernel2<tile_dim><<<grid, block, 0, stream>>>(m, n, k, alpha, A, B, beta, C);
+ dim3 grid(n/tile_dim, m/tile_dim, 1);
+ assert((m % tile_dim) == 0);
+ assert((n % tile_dim) == 0);
+ assert((k % tile_dim) == 0);
+ GEMMKernel2<<<grid, block, 0, stream>>>(m, n, k, alpha, A, B, beta, C);
 }
 
 template <typename T, u32 tile_dim, u8 elements_per_thread>
@@ -277,8 +261,8 @@ __global__ void GEMMKernel4(half *A, half *B, float *C)
   {
    half tile_a[8];
    int row = iwm*32 + wm*16 + (lane_id % 16);
-   int col = (lane_id / 16)*8;
-   LoadMatrix_x4(&(((half *)&shared_A)[row*16 + col]), (uint32_t *)tile_a);
+   int col = lane_id / 16;
+   LoadMatrix_x4(&shared_A[row][col], (uint32_t *)tile_a);
    for(int iwn = 0; iwn < N_tile; ++iwn)
    {
     // Even though the last sixteen threads, in the warp, have the
@@ -287,8 +271,8 @@ __global__ void GEMMKernel4(half *A, half *B, float *C)
     // as expected by mma.
     half tile_b[4];
     int row = lane_id % 16;
-    int col = iwn*32 + wn*8;
-    LoadMatrix_x2(&(((half *)&shared_B)[row*(N_tile*32) + col]), (uint32_t *)tile_b);
+    int col = iwn*4 + wn;
+    LoadMatrix_x2(&shared_B[row][col], (uint32_t *)tile_b);
     MMA_m16n8k16((uint32_t *)tile_a, (uint32_t *)tile_b, tile_c[iwm][iwn]);
   }
  }
@@ -571,9 +555,9 @@ int main(int argc, char **argv)
   Scratch scratch = ScratchBegin(GetScratchArena(GigaBytes(10)));
 
   DataDescriptor<InputType> *desc = PushStructZero(scratch.arena, DataDescriptor<InputType>);
-  u32 m = desc->m = 4096;
-  u32 n = desc->n = 4096;
-  u32 k = desc->k = 4096;
+  u32 m = desc->m = 4096; // 64;
+  u32 n = desc->n = 4096; // 64;
+  u32 k = desc->k = 4096; // 32;
 
   Data<InputType> *data = CreateData<InputType, 0>(scratch.arena, desc, 0);
   // GEMM(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);

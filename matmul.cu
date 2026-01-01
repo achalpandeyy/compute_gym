@@ -242,8 +242,9 @@ __global__ void GEMMKernel4(half *A, half *B, float *C)
    int base_col = step*16;
    int row = tid % (M_tile*32);
    int col = tid / (M_tile*32);
+   int store_col = col ^ ((row/4) % 2);
    uint4 *src = (uint4 *)&A[(base_row + row)*K + (base_col + col*8)];
-   shared_A[row][col] = src[0];
+   shared_A[row][store_col] = src[0];
   }
 
   if(tid < k*8) // 8 uint64 loads per row
@@ -262,7 +263,8 @@ __global__ void GEMMKernel4(half *A, half *B, float *C)
    half tile_a[8];
    int row = iwm*32 + wm*16 + (lane_id % 16);
    int col = lane_id / 16;
-   LoadMatrix_x4(&shared_A[row][col], (uint32_t *)tile_a);
+   int load_col = col ^ ((row/4) % 2);
+   LoadMatrix_x4(&shared_A[row][load_col], (uint32_t *)tile_a);
    for(int iwn = 0; iwn < N_tile; ++iwn)
    {
     // Even though the last sixteen threads, in the warp, have the

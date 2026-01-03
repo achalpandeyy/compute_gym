@@ -214,6 +214,16 @@ __device__ void MMA_m16n8k16(uint32_t *A, uint32_t *B, float *C)
  );
 }
 
+struct Element
+{
+ uint8_t iwm;
+ uint8_t iwn;
+ uint8_t wm;
+ uint8_t wn;
+ uint8_t lane_id;
+};
+static_assert(sizeof(Element)==5);
+
 template<int M, int N, int K, int M_tile, int N_tile>
 __global__ void GEMMKernel4(half *A, half *B, float *C)
 {
@@ -242,8 +252,8 @@ __global__ void GEMMKernel4(half *A, half *B, float *C)
    int base_col = step*16;
    int row = tid % (M_tile*32);
    int col = tid / (M_tile*32);
-   int store_col = col ^ ((row/4) % 2);
    uint4 *src = (uint4 *)&A[(base_row + row)*K + (base_col + col*8)];
+   int store_col = col ^ ((row/4) % 2);
    shared_A[row][store_col] = src[0];
   }
 
@@ -254,7 +264,8 @@ __global__ void GEMMKernel4(half *A, half *B, float *C)
    int row = tid % 16;
    int col = tid / 16;
    uint4 *src = (uint4 *)&B[(base_row + row)*N + (base_col + col*8)];
-   shared_B[row][col] = src[0];
+   int store_col = col ^ (row % 8);
+   shared_B[row][store_col] = src[0];
   }
   __syncthreads();
   
@@ -274,7 +285,8 @@ __global__ void GEMMKernel4(half *A, half *B, float *C)
     half tile_b[4];
     int row = lane_id % 16;
     int col = iwn*4 + wn;
-    LoadMatrix_x2(&shared_B[row][col], (uint32_t *)tile_b);
+    load_col = col ^ (row % 8);
+    LoadMatrix_x2(&shared_B[row][load_col], (uint32_t *)tile_b);
     MMA_m16n8k16((uint32_t *)tile_a, (uint32_t *)tile_b, tile_c[iwm][iwn]);
   }
  }
@@ -540,17 +552,16 @@ int main(int argc, char **argv)
  BeginProfiler();
 
  char *file_name = 0;
- if(argc == 2)
- {
-  file_name = argv[1];
- }
-
+ if(argc == 2) file_name = argv[1];
+ 
  using InputType = half;
  if(1)
  {
+  int debug_buffer_size = MegaBytes(1);
   u8 *d_debug_buffer = 0;
   {
-   CUDACheck(cudaMalloc(&d_debug_buffer, MegaBytes(1)));
+   CUDACheck(cudaMalloc(&d_debug_buffer, debug_buffer_size));
+   CUDACheck(cudaMemset(d_debug_buffer, 0xff, debug_buffer_size));
    CUDACheck(cudaMemcpyToSymbol(g_debug_buffer, &d_debug_buffer, sizeof(g_debug_buffer), 0, cudaMemcpyHostToDevice));
   }
 
@@ -568,7 +579,7 @@ int main(int argc, char **argv)
   // for(int _ = 0; _ < 50 + 5; ++_)
   {
    GEMM4<2, 2>(m, n, k, InputType(1), data->d_A, data->d_B, InputType(0), data->d_C, 0);
-   if (!ValidateGPUOutput<InputType>(scratch.arena, data))
+   if(!ValidateGPUOutput<InputType>(scratch.arena, data))
    {
     printf("Failed\n");
    }

@@ -8,6 +8,8 @@
 #include "ada/kernel1.cu"
 #include "ada/kernel_latest.cu"
 
+#define BENCHMARKING 0
+
 static void LaunchKernel(int index /*0 for latest*/, int M, int N, int K, float alpha, half *A, half *B, float beta, float *C)
 {
  switch(index)
@@ -29,9 +31,9 @@ int main()
 {
  RegisterTracing("Kernel1");
 
- int M = 64;
- int K = 32;
- int N = 64;
+ int M = 4096;
+ int K = 4096;
+ int N = 4096;
  float alpha = 0.5f;
  float beta = 1.f;
  
@@ -54,10 +56,16 @@ int main()
  CUDACheck(cudaMalloc(&d_C, M*N*sizeof(*d_C)));
  CUDACheck(cudaMemcpy(d_C, h_C, M*N*sizeof(*d_C), cudaMemcpyHostToDevice));
 
- LaunchKernel(1, M, N, K, alpha, d_A, d_B, beta, d_C);
+#if BENCHMARKING
+ for(int _ = 0; _ < 50 + 5; _ += 1)
+#endif
+ {
+  LaunchKernel(1, M, N, K, alpha, d_A, d_B, beta, d_C);
+ }
  CUDACheck(cudaDeviceSynchronize());
 
  // compare against cuBLAS
+#if !BENCHMARKING
  if(1)
  {
   bool passed = true;
@@ -107,6 +115,7 @@ int main()
 
   passed ? printf("Passed\n") : printf("Failed\n");
  }
+#endif
 
  return 0;
 }

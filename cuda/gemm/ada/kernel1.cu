@@ -61,6 +61,7 @@ __global__ void Kernel1(int M, int N, int K, half alpha, half *A, half *B, float
    : "r"(regs_a[0]),  "r"(regs_a[1]),  "r"(regs_a[2]),  "r"(regs_a[3]), 
      "r"(regs_b[0]),  "r"(regs_b[1])
   );
+  __syncthreads();
  }
 
  C[(m_block + m_warp + group_id    )*N + (n_block + n_warp + 2*group_lane_id    )] = tile_c[0];

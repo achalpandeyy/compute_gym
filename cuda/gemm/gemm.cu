@@ -6,9 +6,10 @@
 #include "common.cu"
 
 #include "ada/kernel1.cu"
+#include "ada/kernel2.cu"
 #include "ada/kernel_latest.cu"
 
-#define BENCHMARKING 0
+#define BENCHMARKING 1
 
 static void LaunchKernel(int index /*0 for latest*/, int M, int N, int K, float alpha, half *A, half *B, float beta, float *C)
 {
@@ -18,9 +19,15 @@ static void LaunchKernel(int index /*0 for latest*/, int M, int N, int K, float 
   {
    KernelLatestHost<2, 2>(M, N, K, alpha, A, B, beta, C);
   } break;
+
   case 1:
   {
    Kernel1Host(M, N, K, alpha, A, B, beta, C);
+  } break;
+
+  case 2:
+  {
+   Kernel2Host(M, N, K, alpha, A, B, beta, C);
   } break;
 
   default: assert(!"Invalid kernel index");
@@ -29,7 +36,7 @@ static void LaunchKernel(int index /*0 for latest*/, int M, int N, int K, float 
 
 int main()
 {
- RegisterTracing("Kernel1");
+ RegisterTracing("Kernel2");
 
  int M = 4096;
  int K = 4096;
@@ -60,7 +67,7 @@ int main()
  for(int _ = 0; _ < 50 + 5; _ += 1)
 #endif
  {
-  LaunchKernel(1, M, N, K, alpha, d_A, d_B, beta, d_C);
+  LaunchKernel(2, M, N, K, alpha, d_A, d_B, beta, d_C);
  }
  CUDACheck(cudaDeviceSynchronize());
 

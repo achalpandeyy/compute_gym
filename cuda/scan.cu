@@ -2,7 +2,7 @@
 #include "core_memory.h"
 #include "core.h"
 
-#include "common.cuh"
+#include "common.cu"
 
 #include "benchmarking.cu"
 

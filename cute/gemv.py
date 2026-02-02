@@ -11,10 +11,22 @@ def gemv_kernel(M:cutlass.Constexpr, K:cutlass.Constexpr, L:cutlass.Constexpr, s
 
     tx = bidx*bdimx + tidx
 
-    K_TILE_DIM:cutlass.Constexpr = 64
+    # K_TILE_DIM:cutlass.Constexpr = 64
+    m, k = 16, 16
+    K_TILE_DIM:cutlass.Constexpr = 16
 
     sfA_tiles: cute.Tensor = cute.local_tile(input=sfA, tiler=(M, K_TILE_DIM//16, L), coord=(None, None, None))
-    A_tiles:cute.Tensor = cute.local_tile(input=A, tiler=(M, K_TILE_DIM, L), coord=(None, None, None))
+    A_tiles:cute.Tensor = cute.local_tile(input=A, tiler=(m, k, L), coord=(None, None, None))
+    if tidx==0:
+        print(f"A_tiles.layout: {A_tiles.layout}")
+        a0 = A_tiles[None, None, 0, 0, 0, 0].load()
+        cute.print_tensor(a0)
+        a1 = A_tiles[None, None, 0, 1, 0, 0].load()
+        cute.print_tensor(a1)
+        a2 = A_tiles[None, None, 0, 0, 1, 0].load()
+        cute.print_tensor(a2)
+        a3 = A_tiles[None, None, 0, 1, 1, 0].load()
+        cute.print_tensor(a3)
 
     sfB_tiles: cute.Tensor = cute.local_tile(input=sfB, tiler=(1, K_TILE_DIM//16, L), coord=(None, None, None))
     B_tiles:cute.Tensor = cute.local_tile(input=B, tiler=(1, K_TILE_DIM, L), coord=(None, None, None))
@@ -59,12 +71,19 @@ def cute_from_torch(data_ptr:int) -> cute.Pointer:
     return cute.runtime.make_ptr(cutlass.Float32, data_ptr, cute.AddressSpace.gmem)
 
 def gemv_test():
-    M, K, L = 4096, 7168, 8
+    # M, K, L = 4096, 7168, 8
+    M, K, L = 32, 32, 1
     
     # All of these are K-major layout
     
     sfA_torch = torch.full((L, M, K//16), 0.2, dtype=torch.float32, device="cuda").permute(1, 2, 0)
-    A = torch.rand(L, M, K,  dtype=torch.float32, device="cuda").permute(1, 2, 0)
+    A = torch.rand(L, M, K,  dtype=torch.float32, device="cuda").permute(1, 2, 0) # (M, K, L)
+
+    A[0*(M//2):1*(M//2), 0*(K//2):1*(K//2), 0] = 0.0
+    A[0*(M//2):1*(M//2), 1*(K//2):2*(K//2), 0] = 1.0
+    A[1*(M//2):2*(M//2), 0*(K//2):1*(K//2), 0] = 2.0
+    A[1*(M//2):2*(M//2), 1*(K//2):2*(K//2), 0] = 3.0
+    print(A.permute(2, 0, 1)[0, :, :])
     
     sfB_torch = torch.full((L, 1, K//16), 0.2, dtype=torch.float32, device="cuda").permute(1, 2, 0)
     B = torch.ones(L, 1, K,  dtype=torch.float32, device="cuda").permute(1, 2, 0)

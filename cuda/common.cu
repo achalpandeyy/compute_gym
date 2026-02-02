@@ -1,65 +1,72 @@
 #ifndef COMMON_CU
 #define COMMON_CU
 
-#include "core_types.h"
-
 #include <stdio.h>
+#include <assert.h>
 
-inline static u64 GetRandomNumber(u32 max_bits)
+#if BUILD_TRACING
+#include "memory_view/tracing.h"
+#else
+#define RegisterTracing(...)
+#endif
+
+static_assert(std::is_trivially_constructible<half>::value);
+
+inline static uint64_t GetRandomNumber(uint32_t max_bits)
 {
-    // This value is implementation dependent. It's guaranteed that this value is at least 32767.
-    // https://en.cppreference.com/w/c/numeric/random/RAND_MAX.html
-    Assert(RAND_MAX >= 32767);
+ // This value is implementation dependent. It's guaranteed that this value is at least 32767.
+ // https://en.cppreference.com/w/c/numeric/random/RAND_MAX.html
+ static_assert(RAND_MAX >= 32767, "RAND_MAX must be at least 32767");
 
-    u64 result = 0;
-    s32 bits_left = max_bits - 1;
-    while (bits_left > 0)
-    {
-        s32 bits_to_add = Minimum(14, bits_left);
-        u32 mask = (1 << bits_to_add) - 1;
-        
-        u32 x = (u32)rand() & mask;
-        result |= (x << (max_bits - 1 - bits_left));
-        
-        bits_left -= bits_to_add;
-    }
+ uint64_t result = 0;
+ int32_t bits_left = max_bits - 1;
+ while(bits_left > 0)
+ {
+  int32_t bits_to_add = std::min(14, bits_left);
+  uint32_t mask = (1 << bits_to_add) - 1;
+  
+  uint32_t x = (uint32_t)rand() & mask;
+  result |= (x << (max_bits - 1 - bits_left));
+  
+  bits_left -= bits_to_add;
+ }
 
-    Assert(result < (1ull << max_bits));
-    return result;
+ assert(result < (1ull << max_bits));
+ return result;
 }
 
 inline static void GetCUDAErrorDetails(cudaError_t error, char const **error_name, char const **error_string)
 {
-    if (error_name)
-        *error_name = cudaGetErrorName(error);
-    
-    if (error_string)
-        *error_string = cudaGetErrorString(error);
+ if(error_name)
+  *error_name = cudaGetErrorName(error);
+ 
+ if(error_string)
+  *error_string = cudaGetErrorString(error);
 }
 
 #if BUILD_DEBUG
 #define CUDACheck_(fn_call, line)\
 {\
-    cudaError_t prev_error = cudaGetLastError();\
-    while (prev_error != cudaSuccess)\
-    {\
-        char const *error_name = 0;\
-        char const *error_string = 0;\
-        GetCUDAErrorDetails(prev_error, &error_name, &error_string);\
-        printf("[ERROR]: CUDA Runtime already had an error: %s %s", error_name, error_string);\
-        prev_error = cudaGetLastError();\
-    }\
-    fn_call;\
-    cudaDeviceSynchronize();\
-    cudaError_t error = cudaGetLastError();\
-    if (error != cudaSuccess)\
-    {\
-        char const *error_name = 0;\
-        char const *error_string = 0;\
-        GetCUDAErrorDetails(error, &error_name, &error_string);\
-        printf("CUDA Error on line %u: %s %s", line, error_name, error_string);\
-        assert(0);\
-    }\
+ cudaError_t prev_error = cudaGetLastError();\
+ while (prev_error != cudaSuccess)\
+ {\
+  char const *error_name = 0;\
+  char const *error_string = 0;\
+  GetCUDAErrorDetails(prev_error, &error_name, &error_string);\
+  printf("[ERROR]: CUDA Runtime already had an error: %s %s", error_name, error_string);\
+  prev_error = cudaGetLastError();\
+ }\
+ fn_call;\
+ cudaDeviceSynchronize();\
+ cudaError_t error = cudaGetLastError();\
+ if (error != cudaSuccess)\
+ {\
+  char const *error_name = 0;\
+  char const *error_string = 0;\
+  GetCUDAErrorDetails(error, &error_name, &error_string);\
+  printf("CUDA Error on line %u: %s %s", line, error_name, error_string);\
+  assert(0);\
+ }\
 }
 #else
 #define CUDACheck_(fn_call, line) (fn_call);
@@ -67,7 +74,7 @@ inline static void GetCUDAErrorDetails(cudaError_t error, char const **error_nam
 
 #define CUDACheck(...) CUDACheck_(__VA_ARGS__, __LINE__)
 
-static inline u32 GetCUDACoresPerSM(int major, int minor)
+static inline uint32_t GetCUDACoresPerSM(int major, int minor)
 {
     if (major == 7 && minor == 5)
     {
@@ -86,7 +93,7 @@ static inline u32 GetCUDACoresPerSM(int major, int minor)
     return 0;
 }
 
-static void GetPeakMeasurements(f64 *peak_gbps, f64 *peak_gflops, bool print_device_info = false)
+static void GetPeakMeasurements(double *peak_gbps, double *peak_gflops, bool print_device_info = false)
 {
     int device;
     CUDACheck(cudaGetDevice(&device));

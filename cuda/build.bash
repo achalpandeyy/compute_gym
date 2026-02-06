@@ -45,7 +45,7 @@ ctime="../../../../tools/ctime/ctime.exe"
 # build the device patch
 if [ -n "${tracing}" ]; then eval "nvcc.exe -I ../../../aatishbaazi/code/ -I ../../../aatishbaazi/ext/  -I ../../../../cuda_v13.0/compute-sanitizer/include/ -I ../../../../cuda_v13.0/extras/CUPTI/include --generate-code=arch=compute_89,code=[sm_89,compute_89] --diag-suppress 177 -D TRACING_IMPLEMENTATION -x cu  --fatbin --compile-as-tools-patch ../../../aatishbaazi/code/memory_view/tracing.h $out patch.fatbin"; fi
 
-if [ -v reduce ];     then $ctime -begin .reduce.ctm;     eval "$compile ../reduce.cu               $out reduce";     $ctime -end .reduce.ctm $?;     fi
+if [ -v reduce ];     then $ctime -begin .reduce.ctm;     eval "$compile ../reduce/reduce.cu           $out reduce";     $ctime -end .reduce.ctm $?;     fi
 if [ -v scan ];       then $ctime -begin .scan.ctm;       eval "$compile ../scan.cu                 $out scan";       $ctime -end .scan.ctm $?;       fi
 if [ -v gemm ];       then $ctime -begin .gemm.ctm;       eval "$compile ../gemm/gemm.cu cublas.lib  $out gemm";       $ctime -end .gemm.ctm $?;       fi
 

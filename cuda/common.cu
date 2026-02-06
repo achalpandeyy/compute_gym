@@ -10,8 +10,6 @@
 #define RegisterTracing(...)
 #endif
 
-static_assert(std::is_trivially_constructible<half>::value);
-
 inline static uint64_t GetRandomNumber(uint32_t max_bits)
 {
  // This value is implementation dependent. It's guaranteed that this value is at least 32767.

@@ -2,22 +2,24 @@
 
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
+static_assert(std::is_trivially_constructible<half>::value);
 
 #include "common.cu"
 
 #include "ada/kernel1.cu"
 #include "ada/kernel2.cu"
-#include "ada/kernel_latest.cu"
+#include "ada/kernel3.cu"
+// #include "ada/kernel_latest.cu"
 
-#define BENCHMARKING 1
+#define BENCHMARKING 0
 
-static void LaunchKernel(int index /*0 for latest*/, int M, int N, int K, float alpha, half *A, half *B, float beta, float *C)
+static void LaunchKernel(int index /*0 for latest*/, int M, int N, int K, float alpha, half *A, half *B, half *B_T, float beta, float *C)
 {
  switch(index)
  {
   case 0:
   {
-   KernelLatestHost<2, 2>(M, N, K, alpha, A, B, beta, C);
+   // KernelLatestHost<2, 2>(M, N, K, alpha, A, B, beta, C);
   } break;
 
   case 1:
@@ -30,17 +32,22 @@ static void LaunchKernel(int index /*0 for latest*/, int M, int N, int K, float 
    Kernel2Host(M, N, K, alpha, A, B, beta, C);
   } break;
 
+  case 3:
+  {
+   Kernel3Host(M, N, K, alpha, A, B_T, beta, C);
+  } break;
+
   default: assert(!"Invalid kernel index");
  }
 }
 
 int main()
 {
- RegisterTracing("Kernel2");
+ RegisterTracing("Kernel3");
 
- int M = 4096;
- int K = 4096;
- int N = 4096;
+ int M = 64;
+ int K = 32;
+ int N = 64;
  float alpha = 0.5f;
  float beta = 1.f;
  
@@ -53,11 +60,16 @@ int main()
  float *h_C = new float[M*N];
  for(int r = 0; r < M; ++r) for(int c = 0; c < N; ++c) h_C[r*N + c] = distribution(generator);
  
- half *d_A = 0, *d_B = 0;
+ half *d_A = 0, *d_B = 0, *d_B_T = 0;
  CUDACheck(cudaMalloc(&d_A, M*K*sizeof(half)));
  CUDACheck(cudaMemcpy(d_A, h_A, M*K*sizeof(half), cudaMemcpyHostToDevice));
  CUDACheck(cudaMalloc(&d_B, K*N*sizeof(half)));
  CUDACheck(cudaMemcpy(d_B, h_B, K*N*sizeof(half), cudaMemcpyHostToDevice));
+
+ half *h_B_T = new half[K*N];
+ for(int r = 0; r < N; ++r) for(int c = 0; c < K; ++c) h_B_T[r*K + c] = h_B[c*N + r];
+ CUDACheck(cudaMalloc(&d_B_T, K*N*sizeof(half)));
+ CUDACheck(cudaMemcpy(d_B_T, h_B_T, K*N*sizeof(half), cudaMemcpyHostToDevice));
  
  float *d_C = 0;
  CUDACheck(cudaMalloc(&d_C, M*N*sizeof(*d_C)));
@@ -67,7 +79,7 @@ int main()
  for(int _ = 0; _ < 50 + 5; _ += 1)
 #endif
  {
-  LaunchKernel(2, M, N, K, alpha, d_A, d_B, beta, d_C);
+  LaunchKernel(3, M, N, K, alpha, d_A, d_B, d_B_T, beta, d_C);
  }
  CUDACheck(cudaDeviceSynchronize());
 

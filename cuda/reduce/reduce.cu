@@ -2,6 +2,7 @@
 
 #include "kernel1.cu"
 #include "kernel2.cu"
+#include "kernel3.cu"
 
 static void LaunchKernel(int index, int count, int *input, int *output)
 {
@@ -15,6 +16,11 @@ static void LaunchKernel(int index, int count, int *input, int *output)
   case 2:
   {
    Kernel2Host(count, input, output);
+  } break;
+
+  case 3:
+  {
+   Kernel3Host(count, input, output);
   } break;
 
   default:
@@ -39,7 +45,7 @@ int main()
  CUDACheck(cudaMemset(d_output, 0, sizeof(int)));
 
  CUDACheck(cudaMemset(d_output, 0, sizeof(int)));
- LaunchKernel(1, count, d_input, d_output);
+ LaunchKernel(3, count, d_input, d_output);
  CUDACheck(cudaDeviceSynchronize());
 
  int h_output = 0;
